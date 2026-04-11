@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# 05_preprocessing_ALLplasma.py
+# 03_preprocessing_diseasepopulation.py
 #
 # all-subjects, EDTA plasma PREPROCESSING (matches CN training as closely as possible)
 #
@@ -9,12 +9,12 @@
 # - Keeps ONLY proteins used by organ models (from organ_system_mapping.json)
 # - Merges plates HORIZONTALLY by sample_id
 # - Filters to PLASMA ONLY, DROPS CITRATE plasma (keeps EDTA plasma)
-# - Basic QC:
+# - Applies same QC filters as CN training: row_check == PASS, sample_type == Sample
+# - Basic QC (mirrors 01_preprocessing_control exactly):
 #     * enforce >0 for protein values
 #     * log2-transform
-#     * Global Median Normalization (per-sample)
-#     * 5-SD outlier trimming to NaN
-#     * drop zero-variance proteins
+#     * 5-SD outlier trimming to NaN (using CN reference mean/SD, not disease population)
+#     * zero-variance proteins flagged but RETAINED to match trained model feature sets
 # - Preserves ALL disease labels (-1, 0, 1, 2) and clinical fields
 # - Outputs: gnpc_processed_noncontrol.pkl
 
@@ -38,6 +38,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # organ_system_mapping.json from your CN training pipeline
 ORG_MAP_PATH = OUT_DIR / "organ_system_mapping.json"
+
+# CN processed data — used as reference for outlier statistics
+CN_PKL_PATH = OUT_DIR / "gnpc_processed.pkl"
 
 print(f"\nUsing GNPC Clinical directory:\n{CLIN_DIR}\n")
 
@@ -95,6 +98,26 @@ print(f"Number of unique proteins used by organ models: {len(needed_proteins)}\n
 
 if not needed_proteins:
     raise RuntimeError("No proteins found in organ_system_mapping.json. Check that file.")
+
+# ============================================================
+# LOAD CN REFERENCE DATA (for outlier statistics)
+# ============================================================
+
+print(f"Loading CN reference data for QC statistics:\n  {CN_PKL_PATH}\n")
+if not CN_PKL_PATH.exists():
+    raise FileNotFoundError(
+        f"CN reference file not found: {CN_PKL_PATH}\n"
+        "Run 01_preprocessing_control.py first."
+    )
+cn_ref = pd.read_pickle(CN_PKL_PATH)
+
+# Pre-compute per-protein CN mean and SD for outlier removal
+cn_prot_cols = [c for c in cn_ref.columns if c.startswith("seq_")]
+cn_stats = {
+    col: (float(cn_ref[col].mean(skipna=True)), float(cn_ref[col].std(skipna=True)))
+    for col in cn_prot_cols
+}
+print(f"CN reference: {len(cn_ref)} samples, {len(cn_prot_cols)} proteins with statistics\n")
 
 # ============================================================
 # LOAD SOMASCAN FILES (Somalogic01–12) – HORIZONTAL MERGE
@@ -248,6 +271,27 @@ print(data[matrix_col].value_counts(dropna=False))
 print("")
 
 # ============================================================
+# QC FILTERS – MATCH TRAINING (row_check + sample_type)
+# ============================================================
+
+before_qc = data.shape[0]
+
+if "row_check" in data.columns:
+    data = data[data["row_check"] == "PASS"].copy()
+    print(f"row_check == PASS:        {before_qc} → {data.shape[0]} rows")
+    before_qc = data.shape[0]
+else:
+    print("Warning: 'row_check' column not found; skipping QC-pass filter.")
+
+if "sample_type" in data.columns:
+    data = data[data["sample_type"] == "Sample"].copy()
+    print(f"sample_type == Sample:    {before_qc} → {data.shape[0]} rows")
+else:
+    print("Warning: 'sample_type' column not found; skipping sample-type filter.")
+
+print("")
+
+# ============================================================
 # QC STEP 1 – FIX ZERO/NEGATIVE PROTEIN VALUES
 # ============================================================
 
@@ -272,38 +316,50 @@ for col in protein_cols:
 data[protein_cols] = np.log2(data[protein_cols].astype("float32"))
 
 # ============================================================
-# GLOBAL MEDIAN NORMALIZATION (PER-SAMPLE)
+# QC STEP 3 – REMOVE 5-SD OUTLIERS USING CN REFERENCE STATS
 # ============================================================
+# Outlier thresholds are derived from the CN training population (mean/SD),
+# not the disease population, to avoid masking true disease signal and to
+# stay consistent with the reference used during model training.
 
-print("Applying Global Median Normalization...")
-
-sample_medians = data[protein_cols].median(axis=1)
-
-TARGET_MEDIAN = 11.3
-print(f"  -> Aligning samples to Target Median: {TARGET_MEDIAN}")
-
-data[protein_cols] = data[protein_cols].sub(sample_medians, axis=0) + TARGET_MEDIAN
-
-# ============================================================
-# QC STEP 3 – REMOVE 5-SD OUTLIERS (SET TO NaN)
-# ============================================================
+n_outliers_total = 0
+n_proteins_no_ref = 0
 
 for col in protein_cols:
-    vals = data[col].astype("float32")
-    mean = vals.mean()
-    sd   = vals.std()
-    if np.isnan(sd) or sd == 0:
+    if col not in cn_stats:
+        n_proteins_no_ref += 1
         continue
-    mask = (vals - mean).abs() > (5 * sd)
-    data.loc[mask, col] = np.nan
+    ref_mean, ref_sd = cn_stats[col]
+    if np.isnan(ref_sd) or ref_sd == 0:
+        continue
+    vals = data[col].astype("float32")
+    mask = (vals - ref_mean).abs() > (5 * ref_sd)
+    n_out = int(mask.sum())
+    if n_out > 0:
+        data.loc[mask, col] = np.nan
+        n_outliers_total += n_out
+
+print(f"5-SD outlier removal (CN reference): {n_outliers_total} values set to NaN")
+if n_proteins_no_ref > 0:
+    print(f"  Warning: {n_proteins_no_ref} proteins had no CN reference stats; outlier removal skipped for those.")
+print("")
 
 # ============================================================
-# QC STEP 4 – REMOVE ZERO-VARIANCE PROTEINS
+# QC STEP 4 – FLAG ZERO-VARIANCE PROTEINS (DO NOT DROP)
 # ============================================================
+# Proteins are retained even if they have near-zero variance in the disease
+# population. Dropping them would cause a feature mismatch with the trained
+# models, which expect the full protein set from the organ mapping.
 
-keep_prots = [c for c in protein_cols if data[c].var(skipna=True) > 1e-10]
+zero_var_prots = [c for c in protein_cols if data[c].var(skipna=True) <= 1e-10]
+if zero_var_prots:
+    print(f"Warning: {len(zero_var_prots)} proteins have near-zero variance in disease population.")
+    print(f"  These are RETAINED to match the trained model's expected feature set.")
+    print(f"  Proteins: {zero_var_prots[:10]}{'...' if len(zero_var_prots) > 10 else ''}\n")
+else:
+    print("No near-zero-variance proteins detected.\n")
 
-final_cols = ["sample_id"] + keep_prots + ["age"]
+final_cols = ["sample_id"] + protein_cols + ["age"]
 if "sex" in data.columns:
     final_cols.append("sex")
 
@@ -313,7 +369,7 @@ for c in data.columns:
 
 data = data[final_cols]
 
-print(f"Final protein count after QC: {len(keep_prots)}")
+print(f"Final protein count: {len(protein_cols)}")
 print(f"Final dataset shape: {data.shape}\n")
 
 # ============================================================
