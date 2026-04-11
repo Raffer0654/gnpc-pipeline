@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+# 07_compute_disease_metrics_from_imp.py
+#
+# Computes disease-level metrics from NEW 06 output.
+#
+# Compatible with:
+#   1) all_disease_subjects/disease_BAG_predictions_raw_ALLdiseases_imp.csv
+#   2) single_disease_subjects/disease_BAG_predictions_raw_singleDisease_imp.csv
+#
+# Default below is SINGLE-disease input.
+
+import sys
+sys.path = [p for p in sys.path if "jupyterlibraries" not in p]
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.pipeline import Pipeline
+
+# ============================================================
+# PATHS / MODE
+# ============================================================
+
+OUT_DIR = Path("/home/jovyan/work/raffer pipelineScripts/results_disease_comparison")
+
+# Choose which 06 output to summarize:
+USE_SINGLE_DISEASE = True
+
+if USE_SINGLE_DISEASE:
+    DISEASE_PRED_PATH = OUT_DIR / "single_disease_subjects" / "disease_BAG_predictions_raw_singleDisease_imp.csv"
+    OUT_PATH = OUT_DIR / "disease_metrics_raw_singleDisease_imp.csv"
+else:
+    DISEASE_PRED_PATH = OUT_DIR / "all_disease_subjects" / "disease_BAG_predictions_raw_ALLdiseases_imp.csv"
+    OUT_PATH = OUT_DIR / "disease_metrics_raw_ALLdiseases_imp.csv"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def pick_col(df, candidates, required=True, label=""):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise KeyError(
+            f"Missing required column{(' for ' + label) if label else ''}. "
+            f"Tried {candidates}\nAvailable: {list(df.columns)}"
+        )
+    return None
+
+
+# ============================================================
+# LOAD DISEASE PREDICTIONS
+# ============================================================
+
+print("\nLoading disease predictions from NEW 06 output...")
+print(f"Input file: {DISEASE_PRED_PATH}")
+
+if not DISEASE_PRED_PATH.exists():
+    raise FileNotFoundError(f"Disease predictions not found: {DISEASE_PRED_PATH}")
+
+disease = pd.read_csv(DISEASE_PRED_PATH)
+disease.columns = disease.columns.str.strip()
+
+print(f"Loaded shape: {disease.shape}")
+
+# Required columns from new 06
+disease_col = pick_col(disease, ["Disease", "disease", "DISEASE"], label="Disease")
+organ_col   = pick_col(disease, ["organ", "Organ", "OrganSystem"], label="organ")
+model_col   = pick_col(disease, ["model", "Model", "Best_Model_Type"], label="model")
+bag_col     = pick_col(disease, ["BAG_raw", "bag_raw", "BAG", "bag"], label="BAG")
+
+# Optional extras from new 06
+sample_col       = pick_col(disease, ["sample_id", "Sample_ID", "sample"], required=False, label="sample_id")
+disease_count_col = pick_col(disease, ["disease_count"], required=False, label="disease_count")
+is_single_col     = pick_col(disease, ["is_single_disease"], required=False, label="is_single_disease")
+age_chron_col     = pick_col(disease, ["age_chron", "age", "age_at_visit"], required=False, label="chronological age")
+age_pred_col      = pick_col(disease, ["age_pred_raw", "age_pred", "pred_age"], required=False, label="predicted age")
+
+# Clean strings
+disease[disease_col] = disease[disease_col].astype(str).str.strip()
+disease[organ_col]   = disease[organ_col].astype(str).str.strip()
+disease[model_col]   = disease[model_col].astype(str).str.strip()
+
+# Remove rows missing BAG
+before = len(disease)
+disease = disease[disease[bag_col].notna()].copy()
+after = len(disease)
+
+print(f"Filtered rows missing {bag_col}: {before - after}")
+print(f"Remaining rows: {after}")
+
+# Safety check if using single-disease mode
+if USE_SINGLE_DISEASE and is_single_col is not None:
+    n_bad = int((disease[is_single_col] != 1).sum())
+    if n_bad > 0:
+        print(f"Warning: found {n_bad} rows with is_single_disease != 1 in single-disease file")
+
+print("\nUnique diseases found (counts):")
+print(disease[disease_col].value_counts(dropna=False))
+
+
+# ============================================================
+# COMPUTE DISEASE METRICS
+# ============================================================
+
+print("\nComputing disease metrics...")
+
+group_cols = [disease_col, organ_col, model_col]
+
+metrics = (
+    disease
+    .groupby(group_cols, dropna=False)[bag_col]
+    .agg(
+        N_Samples="size",
+        Disease_MAE_raw=lambda x: x.abs().mean(),
+        Disease_Mean_BAG_shift="mean",
+        Disease_SD_BAG="std",
+        Disease_Median_BAG="median",
+        Disease_IQR_BAG=lambda x: x.quantile(0.75) - x.quantile(0.25),
+    )
+    .reset_index()
+    .rename(columns={
+        disease_col: "Disease",
+        organ_col: "organ",
+        model_col: "model",
+    })
+)
+
+# Add age summaries if present
+if age_chron_col is not None:
+    age_stats = (
+        disease
+        .groupby(group_cols, dropna=False)[age_chron_col]
+        .agg(
+            Mean_Age_Chron="mean",
+            SD_Age_Chron="std",
+            Min_Age_Chron="min",
+            Max_Age_Chron="max",
+        )
+        .reset_index()
+    )
+    metrics = metrics.merge(age_stats, on=group_cols, how="left")
+
+if age_pred_col is not None:
+    pred_stats = (
+        disease
+        .groupby(group_cols, dropna=False)[age_pred_col]
+        .agg(
+            Mean_Age_Pred="mean",
+            SD_Age_Pred="std",
+            Min_Age_Pred="min",
+            Max_Age_Pred="max",
+        )
+        .reset_index()
+    )
+    metrics = metrics.merge(pred_stats, on=group_cols, how="left")
+
+# Add disease-count summaries if present
+if disease_count_col is not None:
+    dc_stats = (
+        disease
+        .groupby(group_cols, dropna=False)[disease_count_col]
+        .agg(
+            Mean_Disease_Count="mean",
+            Min_Disease_Count="min",
+            Max_Disease_Count="max",
+        )
+        .reset_index()
+    )
+    metrics = metrics.merge(dc_stats, on=group_cols, how="left")
+
+# Add subject counts if sample_id is available
+if sample_col is not None:
+    subj_counts = (
+        disease
+        .groupby(group_cols, dropna=False)[sample_col]
+        .nunique()
+        .reset_index(name="N_Unique_Subjects")
+    )
+    metrics = metrics.merge(subj_counts, on=group_cols, how="left")
+
+# Add is_single_disease summary if present
+if is_single_col is not None:
+    single_stats = (
+        disease
+        .groupby(group_cols, dropna=False)[is_single_col]
+        .agg(
+            Prop_Is_Single_Disease="mean"
+        )
+        .reset_index()
+    )
+    metrics = metrics.merge(single_stats, on=group_cols, how="left")
+
+# Sort nicely
+metrics = metrics.sort_values(["Disease", "organ", "model"]).reset_index(drop=True)
+
+print("\nMetrics preview:")
+print(metrics.head(25))
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+metrics.to_csv(OUT_PATH, index=False)
+
+print(f"\nSaved disease metrics to:\n  {OUT_PATH}\n")
