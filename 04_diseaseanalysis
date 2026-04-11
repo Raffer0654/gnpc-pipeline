@@ -305,8 +305,9 @@ for organ in sorted(organ_best.keys()):
             if n_remaining:
                 print(f"  [{organ}] {n_remaining} NaNs remain after CN median imputation (proteins absent from CN training)")
     else:
-        if DEBUG:
-            print(f"  [{organ}] Warning: imputation_medians.json not found; re-run 02_model_training to generate it")
+        print(f"  [{organ}] Warning: imputation_medians.json not found; re-run 02_model_training to generate it")
+        print(f"  [{organ}] Falling back to disease-population column medians for imputation")
+        X_df = X_df.fillna(X_df.median(axis=0, skipna=True))
 
     if target_df.empty:
         continue
