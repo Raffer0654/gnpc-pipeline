@@ -1,0 +1,488 @@
+"""
+01_preprocessing_PLASMA.py
+Memory-efficient plasma preprocessing (EDTA-only, CN-only, 1 sample per participant)
+
+Outputs:
+  - processed_data_v4_python/gnpc_processed.pkl (EDTA plasma CN, 1 per participant)
+  - processed_data_v4_python/organ_system_mapping.json
+  - processed_data_v4_python/summary_stats.json
+"""
+
+import sys
+sys.path = [p for p in sys.path if "jupyterlibraries" not in p]
+
+import pandas as pd
+import numpy as np
+import json
+import os
+import glob
+from pathlib import Path
+import warnings
+import gc
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+print("\n")
+print("╔═══════════════════════════════════════════════════════════════╗")
+print("║   PLASMA PREPROCESSING - EDTA ONLY (CN + 1/participant)       ║")
+print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════
+
+BASE_PATH = "/home/jovyan/work/GNPC Harmonised Dataset v1/Clinical"
+OUTPUT_DIR = "processed_data_v4_python"
+
+# PREPROCESSING OPTIONS
+DO_PRE_ZSCORE = False  # kept for compatibility; model pipeline will handle scaling
+
+# 14 ORGAN SYSTEM GROUPINGS (your updated keys)
+ORGAN_SYSTEM_MAP = {
+    "Brain": ["Brain", "Choroid_Plexus"],
+    "Cardiovascular": ["Heart", "Skeletal_Muscle", "Smooth_Muscle", "Blood_Vessel"],
+    "Endocrine": ["Pituitary", "Thyroid", "Adrenal_Gland", "Parathyroid"],
+    "Pulmonary": ["Lung"],
+    "Immune": ["Bone_Marrow", "Lymphoid"],
+    "Hepatic": ["Liver", "Gallbladder"],
+    "Male_Reproductive": ["Testis", "Epididymis", "Prostate", "Seminal"],
+    "Female_Reproductive": ["Ovary", "Endometrium", "Cervix", "Vagina", "Breast", "Placenta", "Fallopian"],
+    "Eye": ["Retina"],
+    "Skin": ["Skin"],
+    "Renal": ["Kidney", "Urinary"],
+    "Pancreas": ["Pancreas"],
+    "Digestive": ["Stomach", "Intestine"],
+    "Salivary": ["Salivary_Gland", "Tongue", "Esophagus"],
+}
+
+if not os.path.exists(BASE_PATH):
+    print(f"⚠️  Path not found: {BASE_PATH}")
+    raise FileNotFoundError(f"Cannot find GNPC data. Please update BASE_PATH.")
+
+os.chdir(BASE_PATH)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════
+# LOAD DATA (MEMORY EFFICIENT)
+# ═══════════════════════════════════════════════════════════════
+
+print("LOADING RAW DATA (MEMORY EFFICIENT)")
+print("═══════════════════════════════════════════════════════════════\n")
+
+print("Loading metadata and clinical data first...")
+meta = pd.read_csv("SomalogicMetaV1_anonymized.csv", low_memory=False)
+clin = pd.read_csv("ClinicalV1_anonymized.csv", low_memory=False)
+
+# Optional: bring in participant/person mapping if present
+# (You mentioned "personmapping file" in other work; this makes 1-per-participant robust.)
+personmap = None
+personmap_path_candidates = [
+    "PersonMappingV1_anonymized.csv",
+    "PersonMappingV1.csv",
+    "personmapping.csv",
+]
+for pm in personmap_path_candidates:
+    if os.path.exists(pm):
+        try:
+            personmap = pd.read_csv(pm, low_memory=False)
+            print(f"Loaded participant mapping: {pm}")
+            break
+        except Exception:
+            personmap = None
+
+# Drop contributor_code from meta to avoid merge conflict (use the one from clin)
+if "contributor_code" in meta.columns:
+    meta = meta.drop(columns=["contributor_code"])
+
+# Merge meta + clinical on sample_id
+meta_clin = meta.merge(clin, on="sample_id", how="left")
+
+# If we found a person mapping file, merge it in (sample_id -> participant/person id)
+# We try to pick a reasonable participant id column name from the mapping file.
+if personmap is not None and "sample_id" in personmap.columns:
+    # choose the first non-sample_id column as participant id if obvious one isn't found
+    pm_candidate_cols = [c for c in personmap.columns if c != "sample_id"]
+    # prefer common names
+    preferred = ["person_id", "participant_id", "individual_id", "subject_id", "ptid", "uid"]
+    pm_id_col = next((c for c in preferred if c in personmap.columns), None)
+    if pm_id_col is None and len(pm_candidate_cols) > 0:
+        pm_id_col = pm_candidate_cols[0]
+    if pm_id_col is not None:
+        meta_clin = meta_clin.merge(
+            personmap[["sample_id", pm_id_col]].drop_duplicates(),
+            on="sample_id",
+            how="left",
+        )
+        # Standardize name to person_id for downstream
+        if pm_id_col != "person_id":
+            meta_clin.rename(columns={pm_id_col: "person_id"}, inplace=True)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: Pre-filter to EDTA plasma CN samples + 1 per participant
+# ═══════════════════════════════════════════════════════════════
+
+print("Pre-filtering to CN EDTA plasma samples + 1 sample per participant...")
+
+# EDTA only (exclude citrate), CN only, QC pass, valid age/sex
+edta_cn_mask = (
+    (meta_clin["sample_type"] == "Sample")
+    & (meta_clin["sample_matrix"] == "EDTA Plasma")   # ✅ EDTA ONLY
+    & (meta_clin["row_check"] == "PASS")
+    & (meta_clin["computed_clinical_diagnosis"] == 0) # CN only
+    & (meta_clin["age_at_visit"] >= 0)
+    & (meta_clin["sex"].isin([1, 2]))
+)
+
+edta_cn = meta_clin.loc[edta_cn_mask].copy()
+print(f"  After EDTA+CN filters: {len(edta_cn)} rows")
+
+# Require cognitive_test_date for choosing earliest (we'll parse; NaT goes last)
+if "cognitive_test_date" not in edta_cn.columns:
+    raise KeyError("ClinicalV1_anonymized.csv is missing 'cognitive_test_date' column.")
+
+edta_cn["cognitive_test_date_dt"] = pd.to_datetime(edta_cn["cognitive_test_date"], errors="coerce")
+
+# Find participant identifier column
+candidate_id_cols = ["person_id", "participant_id", "individual_id", "subject_id", "ptid", "uid"]
+id_col = next((c for c in candidate_id_cols if c in edta_cn.columns), None)
+if id_col is None:
+    raise KeyError(
+        "Could not find a participant identifier column (e.g., person_id/participant_id/etc.). "
+        "If your Clinical file doesn't have it, make sure PersonMappingV1_anonymized.csv is present "
+        "and contains sample_id -> participant mapping."
+    )
+
+# Sort so earliest cognitive_test_date is first; NaT last.
+# Tie-breakers help determinism.
+sort_cols = ["cognitive_test_date_dt"]
+if "sequential_visit_number" in edta_cn.columns:
+    sort_cols.append("sequential_visit_number")
+if "age_at_visit" in edta_cn.columns:
+    sort_cols.append("age_at_visit")
+
+edta_cn = edta_cn.sort_values(by=sort_cols, ascending=[True]*len(sort_cols), na_position="last")
+
+# Keep only earliest cognitive_test_date sample per participant
+edta_cn_unique = edta_cn.drop_duplicates(subset=[id_col], keep="first").copy()
+plasma_cn_samples = edta_cn_unique["sample_id"].values
+plasma_cn_samples_set = set(plasma_cn_samples)
+
+print(f"  After 1-per-participant (earliest cognitive_test_date): {len(plasma_cn_samples)} samples\n")
+
+# ═══════════════════════════════════════════════════════════════
+# LOAD PROTEIN DATA FILE BY FILE (filter immediately)
+# ═══════════════════════════════════════════════════════════════
+
+print("Loading and filtering protein files...")
+
+def load_and_filter_soma(n, sample_id_set):
+    """Load one SomaLogic file and immediately filter to desired samples."""
+    filename = f"Somalogic{n:02d}V1_anonymized.csv"
+    print(f"  File {n:2d}: {filename}")
+
+    df = pd.read_csv(filename, low_memory=False)
+
+    # Filter early
+    df_filt = df[df["sample_id"].isin(sample_id_set)].copy()
+
+    # Keep only protein columns + sample_id
+    protein_cols = [col for col in df_filt.columns if col.startswith("seq_")]
+    df_filt = df_filt[["sample_id"] + protein_cols]
+
+    print(f"           Filtered: {len(df_filt)} rows, {len(protein_cols)} proteins")
+
+    del df
+    gc.collect()
+
+    return df_filt, protein_cols
+
+# Load all 12 files (filtered)
+all_protein_data = []
+all_protein_cols = set()
+
+for i in range(1, 13):
+    df_filt, cols = load_and_filter_soma(i, plasma_cn_samples_set)
+    all_protein_data.append(df_filt)
+    all_protein_cols.update(cols)
+
+print(f"\n  Total unique proteins (raw seq_): {len(all_protein_cols)}")
+
+# Merge protein data
+print("\nMerging filtered protein data...")
+protein_data = all_protein_data[0]
+for i, df in enumerate(all_protein_data[1:], 2):
+    print(f"  Merging file {i}...")
+    protein_data = protein_data.merge(df, on="sample_id", how="left")
+    del df
+    gc.collect()
+
+del all_protein_data
+gc.collect()
+
+print(f"  Merged shape: {protein_data.shape}")
+
+# Join with metadata/clinical columns you want to keep
+print("\nJoining with metadata/clinical...")
+keep_cols = [
+    "sample_id",
+    "sample_matrix",
+    "sample_type",
+    "row_check",
+    "plate_id",
+    "contributor_code",
+    "age_at_visit",
+    "sex",
+    "computed_clinical_diagnosis",
+    "years_of_education",
+    "sequential_visit_number",
+    "cognitive_test_date",
+]
+# include participant id col
+if id_col not in keep_cols:
+    keep_cols.append(id_col)
+
+# Some cols might not exist depending on file version; keep only those that exist
+keep_cols = [c for c in keep_cols if c in edta_cn_unique.columns]
+
+data_filt = protein_data.merge(edta_cn_unique[keep_cols], on="sample_id", how="left")
+data_filt.rename(columns={"age_at_visit": "age"}, inplace=True)
+
+del protein_data, meta, clin, meta_clin, edta_cn, edta_cn_unique
+gc.collect()
+
+prot_cols = [col for col in data_filt.columns if col.startswith("seq_")]
+
+print(f"\n✓ Final (pre-QC) dataset: {len(data_filt)} samples, {len(prot_cols)} proteins")
+print(f"  Age range: {data_filt['age'].min():.0f} - {data_filt['age'].max():.0f} years")
+print(f"  Age mean:  {data_filt['age'].mean():.1f} ± {data_filt['age'].std():.1f} years\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: Handle zeros/negatives (pre-log)
+# ═══════════════════════════════════════════════════════════════
+
+print("STEP 2: Handling zeros/negatives before log2")
+print("─────────────────────────────────────────────────────────────\n")
+
+prot_matrix = data_filt[prot_cols].values
+n_zeros = np.sum(prot_matrix == 0)
+n_negative = np.sum(prot_matrix < 0)
+n_total = np.sum(~np.isnan(prot_matrix))
+
+print(f"  Zeros:     {n_zeros} ({100*n_zeros/n_total:.3f}%)")
+print(f"  Negatives: {n_negative} ({100*n_negative/n_total:.3f}%)\n")
+
+if n_zeros > 0 or n_negative > 0:
+    print("  Replacing <=0 with min positive value per protein...")
+    for p in prot_cols:
+        vals = data_filt[p].values
+        positive_vals = vals[vals > 0]
+        if len(positive_vals) > 0:
+            min_pos = np.nanmin(positive_vals)
+            data_filt.loc[vals <= 0, p] = min_pos
+        else:
+            data_filt.loc[vals <= 0, p] = 0.001
+    print("  ✓ Replaced\n")
+
+del prot_matrix
+gc.collect()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: Log2 transform
+# ═══════════════════════════════════════════════════════════════
+
+print("STEP 3: Log2 transformation")
+print("─────────────────────────────────────────────────────────────\n")
+
+data_filt[prot_cols] = np.log2(data_filt[prot_cols])
+
+n_inf = np.sum(np.isinf(data_filt[prot_cols].values))
+if n_inf > 0:
+    raise ValueError(f"ERROR: {n_inf} inf/-inf values after log2!")
+
+print("✓ Log2 transformed\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: Filter to human proteins
+# ═══════════════════════════════════════════════════════════════
+
+print("STEP 4: Filter to human proteins")
+print("─────────────────────────────────────────────────────────────\n")
+
+analytes = pd.read_csv("SomalogicAnalyteInfoV1_anonymized.csv", low_memory=False)
+
+human_prots = analytes[
+    (~analytes["entrez_gene_symbol"].isna()) &
+    (analytes["column_name"].isin(prot_cols))
+]["column_name"].unique().tolist()
+
+non_human = [p for p in prot_cols if p not in human_prots]
+data_filt.drop(columns=non_human, inplace=True)
+prot_cols_final = human_prots
+
+print(f"✓ Kept {len(human_prots)} human proteins\n")
+gc.collect()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: Remove extreme outliers (>5 SD)
+# ═══════════════════════════════════════════════════════════════
+
+print("STEP 5: Remove extreme outliers (>5 SD)")
+print("─────────────────────────────────────────────────────────────\n")
+
+outliers_removed = 0
+for p in prot_cols_final:
+    vals = data_filt[p].values
+    p_mean = np.nanmean(vals)
+    p_sd = np.nanstd(vals)
+    if p_sd > 0:
+        outlier_mask = np.abs(vals - p_mean) > 5 * p_sd
+        n_outliers = int(np.sum(outlier_mask))
+        if n_outliers > 0:
+            data_filt.loc[outlier_mask, p] = np.nan
+            outliers_removed += n_outliers
+
+print(f"✓ Removed {outliers_removed} extreme outliers (set to NaN)\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: Remove NA/zero-variance proteins
+# ═══════════════════════════════════════════════════════════════
+
+print("STEP 6: Remove NA/zero-variance proteins")
+print("─────────────────────────────────────────────────────────────\n")
+
+pre_vars = data_filt[prot_cols_final].var()
+na_or_zero_var = pre_vars.isna() | (pre_vars < 1e-10)
+n_bad = int(na_or_zero_var.sum())
+
+if n_bad > 0:
+    print(f"  Removing {n_bad} proteins with NA/zero variance...")
+    good_prots = [p for p, is_bad in zip(prot_cols_final, na_or_zero_var) if not is_bad]
+    bad_prots  = [p for p, is_bad in zip(prot_cols_final, na_or_zero_var) if is_bad]
+    data_filt.drop(columns=bad_prots, inplace=True)
+    prot_cols_final = good_prots
+    print(f"  Kept: {len(prot_cols_final)} proteins\n")
+else:
+    print("  ✓ No zero-variance proteins\n")
+
+print("FINAL EDTA PLASMA DATASET (post-QC):")
+print(f"  Samples:  {len(data_filt)}")
+print(f"  Proteins: {len(prot_cols_final)}")
+print(f"  Age:      {data_filt['age'].mean():.1f} ± {data_filt['age'].std():.1f} years")
+print(f"  Range:    {data_filt['age'].min():.0f} - {data_filt['age'].max():.0f} years\n")
+
+# ═══════════════════════════════════════════════════════════════
+# CREATE ORGAN MAPPINGS
+# ═══════════════════════════════════════════════════════════════
+
+print(f"\n{'='*70}")
+print("CREATING ORGAN SYSTEM MAPPINGS")
+print(f"{'='*70}\n")
+
+json_files = glob.glob("/home/jovyan/work/HPA_Organs_updated/*.json")
+
+def load_organ(json_path):
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    organ = Path(json_path).stem
+    if isinstance(data, list):
+        genes = [item.get("Gene") for item in data if isinstance(item, dict) and "Gene" in item]
+    elif isinstance(data, dict) and "Gene" in data:
+        genes = [data["Gene"]]
+    else:
+        genes = []
+    genes = [g for g in genes if g]  # drop None/empty
+    return organ, genes
+
+# Load once (avoid double-reading)
+organ_genes = {}
+for fp in json_files:
+    organ, genes = load_organ(fp)
+    organ_genes[organ] = genes
+
+# Protein-to-gene mapping (only for final kept proteins)
+prot_map = analytes[
+    (~analytes["entrez_gene_symbol"].isna()) &
+    (analytes["column_name"].isin(prot_cols_final))
+][["column_name", "entrez_gene_symbol"]].drop_duplicates()
+
+# Map HPA organs -> proteins
+hpa_to_proteins = {}
+for organ_name, genes in organ_genes.items():
+    prots = prot_map[prot_map["entrez_gene_symbol"].isin(genes)]["column_name"].unique().tolist()
+    if len(prots) > 0:
+        hpa_to_proteins[organ_name.lower()] = prots
+
+# Group into organ systems
+organ_system_proteins = {}
+for system_name, hpa_organs in ORGAN_SYSTEM_MAP.items():
+    system_proteins = set()
+    for hpa_organ in hpa_organs:
+        key = hpa_organ.lower()
+        if key in hpa_to_proteins:
+            system_proteins.update(hpa_to_proteins[key])
+    if len(system_proteins) > 0:
+        organ_system_proteins[system_name] = sorted(system_proteins)
+
+print("Organ system protein counts:\n")
+for system in sorted(organ_system_proteins.keys(), key=lambda x: len(organ_system_proteins[x]), reverse=True):
+    print(f"  {system:<25s}: {len(organ_system_proteins[system]):>4d} proteins")
+
+# ═══════════════════════════════════════════════════════════════
+# SAVE OUTPUTS
+# ═══════════════════════════════════════════════════════════════
+
+print(f"\n{'='*70}")
+print("SAVING OUTPUTS")
+print(f"{'='*70}\n")
+
+# Save plasma
+out_pkl = f"{OUTPUT_DIR}/gnpc_processed.pkl"
+data_filt.to_pickle(out_pkl)
+print(f"✓ Saved: {out_pkl}")
+
+# Save organ mappings
+out_map = f"{OUTPUT_DIR}/organ_system_mapping.json"
+with open(out_map, "w") as f:
+    json.dump(organ_system_proteins, f, indent=2)
+print(f"✓ Saved: {out_map}")
+
+# Save summary
+summary = {
+    "matrix_type": "EDTA_plasma",
+    "samples": int(len(data_filt)),
+    "proteins": int(len(prot_cols_final)),
+    "organ_systems": int(len(organ_system_proteins)),
+    "age_range": [float(data_filt["age"].min()), float(data_filt["age"].max())],
+    "age_mean": float(data_filt["age"].mean()),
+    "age_sd": float(data_filt["age"].std()),
+    "protein_list": prot_cols_final,
+    "one_sample_per_participant": True,
+    "participant_id_col": id_col,
+    "selection_rule": "earliest cognitive_test_date (NaT last; tie-breakers: sequential_visit_number, age_at_visit)",
+}
+
+out_sum = f"{OUTPUT_DIR}/summary_stats.json"
+with open(out_sum, "w") as f:
+    json.dump(summary, f, indent=2)
+print(f"✓ Saved: {out_sum}")
+
+print("\n")
+print("╔═══════════════════════════════════════════════════════════════╗")
+print("║              PREPROCESSING COMPLETE ✓✓✓                       ║")
+print("╚═══════════════════════════════════════════════════════════════╝\n")
+
+print("EDTA PLASMA DATASET:")
+print(f"  Samples:       {len(data_filt)} (CN, 1 per participant)")
+print(f"  Proteins:      {len(prot_cols_final)}")
+print(f"  Organ systems: {len(organ_system_proteins)}")
+print(f"  Age:           {data_filt['age'].mean():.1f} ± {data_filt['age'].std():.1f} years")
+print(f"  Range:         {data_filt['age'].min():.0f} - {data_filt['age'].max():.0f} years\n")
+
+print("═══════════════════════════════════════════════════════════════")
+print(f"All files saved to: {OUTPUT_DIR}/")
+print("  • gnpc_processed.pkl (EDTA plasma data)")
+print("  • organ_system_mapping.json (EDTA organs)")
+print("  • summary_stats.json")
+print("\nNext step: python 02_analysis.py")
+print("═══════════════════════════════════════════════════════════════\n")
