@@ -58,9 +58,11 @@ def preprocess_gnpc_for_organ_age_prediction(
 
     # ----------------------------
     # Split FIRST (so medians are from TRAIN only)
+    # Stratify by age quintile so train/test have matched age distributions
     # ----------------------------
     idx = np.arange(len(df_sub))
-    idx_train, idx_test = train_test_split(idx, test_size=test_size, random_state=seed)
+    age_bins = pd.qcut(df_sub[target_col], q=5, labels=False, duplicates="drop")
+    idx_train, idx_test = train_test_split(idx, test_size=test_size, random_state=seed, stratify=age_bins)
 
     train_df = df_sub.iloc[idx_train].copy()
     test_df  = df_sub.iloc[idx_test].copy()
@@ -339,8 +341,21 @@ def main():
         # Save CN training medians so inference scripts can impute consistently
         organ_dir = OUTPUT_DIR / organ
         organ_dir.mkdir(parents=True, exist_ok=True)
+
+        # 80%-split medians — kept for internal train/test bookkeeping
         with open(organ_dir / "imputation_medians.json", "w") as f:
             json.dump(data["train_medians"], f)
+
+        # Full-CN medians — correct reference for imputing external (disease) data;
+        # using 80% split medians for external inference was unnecessarily conservative
+        organ_cols_full = organ_map[organ]
+        full_medians = (
+            df[organ_cols_full].median(axis=0, skipna=True)
+            .fillna(0.0)
+            .to_dict()
+        )
+        with open(organ_dir / "imputation_medians_full.json", "w") as f:
+            json.dump(full_medians, f)
 
         print(
             f"  Train kept: {data['n_train_after']}/{data['n_train_before']} "

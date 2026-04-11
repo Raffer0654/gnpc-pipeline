@@ -294,8 +294,8 @@ for organ in sorted(organ_best.keys()):
     if DEBUG and (before_rows - len(target_df)) > 0:
         print(f"  [{organ}] high-missing rows dropped (>{int(MISS_THRESH*100)}%): {before_rows} -> {len(target_df)}")
 
-    # Impute remaining NaNs with CN training medians (same reference as training)
-    medians_path = organ_best[organ]["model_dir"].parent / "imputation_medians.json"
+    # Impute remaining NaNs with full-CN medians (all CN participants, not just 80% split)
+    medians_path = organ_best[organ]["model_dir"].parent / "imputation_medians_full.json"
     if medians_path.exists():
         with open(medians_path, "r") as f:
             cn_medians = pd.Series(json.load(f))
@@ -305,7 +305,7 @@ for organ in sorted(organ_best.keys()):
             if n_remaining:
                 print(f"  [{organ}] {n_remaining} NaNs remain after CN median imputation (proteins absent from CN training)")
     else:
-        print(f"  [{organ}] Warning: imputation_medians.json not found; re-run 02_model_training to generate it")
+        print(f"  [{organ}] Warning: imputation_medians_full.json not found; re-run 02_model_training to generate it")
         print(f"  [{organ}] Falling back to disease-population column medians for imputation")
         X_df = X_df.fillna(X_df.median(axis=0, skipna=True))
 
