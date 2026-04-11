@@ -48,7 +48,7 @@ OUT_PATH_SINGLE = OUT_DIR_SINGLE / "disease_BAG_predictions_raw_singleDisease_im
 
 MODEL_SELECT_METRIC = "test_mae"
 
-DROPNA_FEATURE_ROWS = True
+MISS_THRESH = 0.30  # mirrors training: drop rows with >30% missing, then impute remainder
 
 # ============================================================
 # HELPERS
@@ -283,17 +283,30 @@ for organ in sorted(organ_best.keys()):
 
     X_df = target_df[feat_list].astype("float32")
 
-    col_medians = fail_loud_all_nan_columns(X_df, organ)
+    fail_loud_all_nan_columns(X_df, organ)
 
-    if DROPNA_FEATURE_ROWS:
-        before_rows = len(target_df)
-        mask_complete = ~X_df.isna().any(axis=1)
-        target_df = target_df.loc[mask_complete].copy()
-        X_df = X_df.loc[mask_complete].copy()
+    # Drop rows with >MISS_THRESH missing proteins — matches training threshold
+    before_rows = len(target_df)
+    row_miss_rate = X_df.isna().mean(axis=1)
+    keep_mask = row_miss_rate <= MISS_THRESH
+    target_df = target_df.loc[keep_mask].copy()
+    X_df = X_df.loc[keep_mask].copy()
+    if DEBUG and (before_rows - len(target_df)) > 0:
+        print(f"  [{organ}] high-missing rows dropped (>{int(MISS_THRESH*100)}%): {before_rows} -> {len(target_df)}")
+
+    # Impute remaining NaNs with CN training medians (same reference as training)
+    medians_path = organ_best[organ]["model_dir"].parent / "imputation_medians.json"
+    if medians_path.exists():
+        with open(medians_path, "r") as f:
+            cn_medians = pd.Series(json.load(f))
+        X_df = X_df.fillna(cn_medians)
         if DEBUG:
-            print(f"  [{organ}] dropna rows: {before_rows} -> {len(target_df)}")
+            n_remaining = int(X_df.isna().sum().sum())
+            if n_remaining:
+                print(f"  [{organ}] {n_remaining} NaNs remain after CN median imputation (proteins absent from CN training)")
     else:
-        X_df = X_df.fillna(col_medians)
+        if DEBUG:
+            print(f"  [{organ}] Warning: imputation_medians.json not found; re-run 02_model_training to generate it")
 
     if target_df.empty:
         continue

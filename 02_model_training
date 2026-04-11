@@ -114,6 +114,7 @@ def preprocess_gnpc_for_organ_age_prediction(
         "miss_thresh": float(miss_thresh),
         "impute": "median(train) after dropping high-missing rows",
         "median_fallback": float(median_fallback),
+        "train_medians": medians.to_dict(),  # CN training medians for inference-time imputation
 
         # bookkeeping
         "n_train_before": int(n_train_before),
@@ -334,6 +335,12 @@ def main():
             return_ids=RETURN_IDS,
             miss_thresh=MISS_THRESH,
         )
+
+        # Save CN training medians so inference scripts can impute consistently
+        organ_dir = OUTPUT_DIR / organ
+        organ_dir.mkdir(parents=True, exist_ok=True)
+        with open(organ_dir / "imputation_medians.json", "w") as f:
+            json.dump(data["train_medians"], f)
 
         print(
             f"  Train kept: {data['n_train_after']}/{data['n_train_before']} "
