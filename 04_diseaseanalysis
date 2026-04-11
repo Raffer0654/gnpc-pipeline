@@ -1,0 +1,374 @@
+#!/usr/bin/env python
+# 06_disease_BAG_analysis_from_AdaTest.py
+#
+# DISEASE BAG PREDICTION — RAW ONLY
+#
+# NEW OUTPUTS (two folders):
+#   1) all_disease_subjects/    -> includes comorbid patients (long format: 1 row per positive disease)
+#   2) single_disease_subjects/ -> disease-only patients (subset of above where disease_count==1)
+#
+# Uses CN-trained organ-age models under:
+#   <MODEL_ROOT>/<Organ>/{lasso,en,svr}/best_model.joblib
+#
+# Output columns include:
+#   sample_id, organ, model, Disease, disease_count, is_single_disease,
+#   age_chron, age_pred_raw, BAG_raw, plus disease indicator columns
+
+import sys
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.pipeline import Pipeline
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEBUG = True
+
+MODEL_ROOT = Path("/home/jovyan/work/raffer pipelineScripts/results_imputation_miss30")
+
+DATA_PATH    = Path("../GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python/gnpc_processed_noncontrol.pkl")
+ORG_MAP_PATH = Path("../GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python/organ_system_mapping.json")
+
+OUT_DIR  = Path("/home/jovyan/work/raffer pipelineScripts/results_disease_comparison")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_DIR_ALL    = OUT_DIR / "all_disease_subjects"
+OUT_DIR_SINGLE = OUT_DIR / "single_disease_subjects"
+OUT_DIR_ALL.mkdir(parents=True, exist_ok=True)
+OUT_DIR_SINGLE.mkdir(parents=True, exist_ok=True)
+
+OUT_PATH_ALL = OUT_DIR_ALL / "disease_BAG_predictions_raw_ALLdiseases_imp.csv"
+OUT_PATH_SINGLE = OUT_DIR_SINGLE / "disease_BAG_predictions_raw_singleDisease_imp.csv"
+
+MODEL_SELECT_METRIC = "test_mae"
+
+DROPNA_FEATURE_ROWS = True
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+EXPECTED_MODELS = ("lasso", "en", "svr")
+
+def looks_like_estimator(obj) -> bool:
+    return hasattr(obj, "predict") and callable(getattr(obj, "predict"))
+
+def get_model_label(model_obj):
+    if isinstance(model_obj, Pipeline) and hasattr(model_obj, "named_steps") and "model" in model_obj.named_steps:
+        est = model_obj.named_steps["model"]
+        name = type(est).__name__.lower()
+        if "svr" in name:
+            return "svr"
+        if "lasso" in name:
+            return "lasso"
+        if "elasticnet" in name or "elastic_net" in name:
+            return "en"
+        return name
+    return type(model_obj).__name__.lower()
+
+def fail_loud_all_nan_columns(X_df: pd.DataFrame, organ: str):
+    col_medians = X_df.median(axis=0, skipna=True)
+    all_nan_cols = col_medians[col_medians.isna()].index.tolist()
+    if all_nan_cols:
+        raise ValueError(
+            f"[{organ}] Found {len(all_nan_cols)} ALL-NaN protein columns in this cohort "
+            f"(example: {all_nan_cols[:10]}). Fix upstream missingness or drop/retrain."
+        )
+    return col_medians
+
+def safe_read_json(path: Path):
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def discover_candidate_models_for_organ(organ: str):
+    out = []
+    organ_dir = MODEL_ROOT / organ
+    if not organ_dir.exists():
+        return out
+
+    for model_tag in EXPECTED_MODELS:
+        md = organ_dir / model_tag
+        if not md.exists():
+            continue
+        mpath = md / "best_model.joblib"
+        metrics = safe_read_json(md / "metrics.json")
+        out.append({
+            "model_tag": model_tag,
+            "model_dir": md,
+            "best_model_path": mpath if mpath.exists() else None,
+            "metrics": metrics,
+        })
+    return out
+
+def pick_best_model_candidate(cands, metric_key: str):
+    scored = []
+    for c in cands:
+        if c["best_model_path"] is None:
+            continue
+        metrics = c.get("metrics") or {}
+        val = metrics.get(metric_key, None)
+
+        if val is None:
+            if metric_key == "test_mae":
+                val = metrics.get("nested_cv_mae_mean", None)
+            elif metric_key == "nested_cv_mae_mean":
+                val = metrics.get("test_mae", None)
+
+        if val is None:
+            continue
+
+        try:
+            scored.append((float(val), c))
+        except Exception:
+            continue
+
+    if scored:
+        scored.sort(key=lambda x: x[0])
+        return scored[0][1]
+
+    for c in cands:
+        if c["best_model_path"] is not None:
+            return c
+
+    return None
+
+# ============================================================
+# LOAD DATA + MAP
+# ============================================================
+
+print("-" * 70)
+print("LOADING DISEASE DATA + ORGAN MAP + ADA_TEST MODELS")
+print("-" * 70)
+
+if not DATA_PATH.exists():
+    raise FileNotFoundError(f"Input disease data not found: {DATA_PATH}")
+df = pd.read_pickle(DATA_PATH)
+print(f"✓ Loaded disease dataframe: {df.shape}")
+
+if not ORG_MAP_PATH.exists():
+    raise FileNotFoundError(f"Organ mapping not found: {ORG_MAP_PATH}")
+with open(ORG_MAP_PATH, "r") as f:
+    organ_map = json.load(f)
+print(f"✓ Loaded organ_system_mapping.json with {len(organ_map)} organs")
+
+if not MODEL_ROOT.exists():
+    raise FileNotFoundError(f"MODEL_ROOT not found: {MODEL_ROOT}")
+print(f"✓ Using MODEL_ROOT: {MODEL_ROOT}")
+
+# ============================================================
+# DISEASE CLEANING (KEEP COMORBID + ALSO FLAG SINGLE)
+# ============================================================
+
+disease_cols = [
+    "stroke","tia","tbi","ad","ftd","pd","als","mci_sci",
+    "cancer","diabetes","chf","copd","mi","afib","angina",
+    "hyperlipidaemia","hypertension","depression","anxiety"
+]
+disease_cols = [c for c in disease_cols if c in df.columns]
+
+print(f"\nFound {len(disease_cols)} disease label columns in df.")
+df = df.copy()
+
+if disease_cols:
+    df[disease_cols] = df[disease_cols].replace({-1: 0, 2: 0})
+    df[disease_cols] = df[disease_cols].clip(0, 1).astype(int)
+    df["disease_count"] = df[disease_cols].sum(axis=1).astype(int)
+else:
+    df["disease_count"] = 0
+
+# Required columns
+if "age" not in df.columns:
+    raise KeyError("Disease dataframe missing required column: age")
+if "sample_id" not in df.columns:
+    raise KeyError("Disease dataframe missing required column: sample_id")
+
+df = df[df["age"].notna()].copy()
+df["sample_id"] = df["sample_id"].astype(str)
+
+# Keep only rows that have at least 1 disease label (safety; noncontrol likely already satisfies this)
+df = df[df["disease_count"] >= 1].copy()
+
+df["is_single_disease"] = (df["disease_count"] == 1).astype(int)
+
+print(f"All-disease cohort: N={len(df):,}")
+print(f"Single-disease subset: N={int(df['is_single_disease'].sum()):,}")
+
+# ============================================================
+# PICK ONE BEST MODEL PER ORGAN
+# ============================================================
+
+orgs_to_run = [o for o in organ_map.keys()]
+organ_best = {}
+
+for organ in orgs_to_run:
+    cands = discover_candidate_models_for_organ(organ)
+    best = pick_best_model_candidate(cands, MODEL_SELECT_METRIC)
+    if best is None:
+        continue
+
+    organ_best[organ] = {
+        "model_tag": best["model_tag"],
+        "model_path": best["best_model_path"],
+        "metrics": best.get("metrics"),
+        "model_dir": best["model_dir"],
+    }
+
+print(f"\n✓ Selected best model for {len(organ_best)} organs (based on {MODEL_SELECT_METRIC}).")
+if DEBUG:
+    for org in sorted(organ_best.keys()):
+        meta = organ_best[org]
+        m = meta.get("metrics") or {}
+        print(
+            f"  {org:20s} -> {meta['model_tag']:5s} | "
+            f"test_mae={m.get('test_mae', None)} | nested_cv_mae_mean={m.get('nested_cv_mae_mean', None)}"
+        )
+
+# ============================================================
+# RUN PREDICTIONS (LONG FORMAT: one row per positive disease)
+# ============================================================
+
+def positive_diseases_row(row: pd.Series, disease_cols: list[str]) -> list[str]:
+    if not disease_cols:
+        return []
+    return [d for d in disease_cols if int(row.get(d, 0)) == 1]
+
+records_long = []
+
+print("\n" + "=" * 70)
+print("RUNNING DISEASE BAG PREDICTIONS (RAW) USING ADA_TEST MODELS")
+print("Saving LONG format: each patient contributes one row per positive disease label")
+print("=" * 70)
+
+for organ in sorted(organ_best.keys()):
+
+    feat_list = organ_map[organ]
+    missing_feats = [f for f in feat_list if f not in df.columns]
+    if missing_feats:
+        if DEBUG:
+            print(f"Skipping {organ}: missing {len(missing_feats)} proteins (e.g., {missing_feats[:5]}).")
+        continue
+
+    # Sex restrictions (if present)
+    if "sex" in df.columns:
+        if organ == "Female_Reproductive":
+            target_df = df[df["sex"] == 2].copy()
+            if DEBUG:
+                print(f"{organ:20s} : Females only (N={len(target_df)})")
+        elif organ == "Male_Reproductive":
+            target_df = df[df["sex"] == 1].copy()
+            if DEBUG:
+                print(f"{organ:20s} : Males only   (N={len(target_df)})")
+        else:
+            target_df = df.copy()
+            if DEBUG:
+                print(f"{organ:20s} : All subjects (N={len(target_df)})")
+    else:
+        target_df = df.copy()
+        if DEBUG:
+            print(f"{organ:20s} : All subjects (N={len(target_df)})")
+
+    if target_df.empty:
+        continue
+
+    X_df = target_df[feat_list].astype("float32")
+
+    col_medians = fail_loud_all_nan_columns(X_df, organ)
+
+    if DROPNA_FEATURE_ROWS:
+        before_rows = len(target_df)
+        mask_complete = ~X_df.isna().any(axis=1)
+        target_df = target_df.loc[mask_complete].copy()
+        X_df = X_df.loc[mask_complete].copy()
+        if DEBUG:
+            print(f"  [{organ}] dropna rows: {before_rows} -> {len(target_df)}")
+    else:
+        X_df = X_df.fillna(col_medians)
+
+    if target_df.empty:
+        continue
+
+    # Load model
+    model_path = organ_best[organ]["model_path"]
+    model_tag = organ_best[organ]["model_tag"]
+    model = joblib.load(model_path)
+    if not looks_like_estimator(model):
+        raise ValueError(f"[{organ}] Loaded object is not a predictor: {model_path}")
+
+    if DEBUG:
+        miss_rate = float(X_df.isna().mean().mean()) if len(X_df) else 0.0
+        print(
+            f"  [DEBUG {organ}] X={X_df.shape} miss={miss_rate:.4f} "
+            f"expects={getattr(model, 'n_features_in_', None)} model={get_model_label(model)}"
+        )
+
+    # Predict once per patient
+    X_np = X_df.to_numpy(dtype=np.float32)
+    age_vec = target_df["age"].astype(float).to_numpy()
+    sid_vec = target_df["sample_id"].to_numpy()
+    dis_count = target_df["disease_count"].astype(int).to_numpy()
+    is_single = target_df["is_single_disease"].astype(int).to_numpy()
+
+    y_pred = model.predict(X_np)
+    bag = y_pred - age_vec
+
+    # Expand to one row per positive disease label
+    for i in range(len(sid_vec)):
+        row = target_df.iloc[i]
+        pos_dis = positive_diseases_row(row, disease_cols)
+        if not pos_dis:
+            continue
+        for d in pos_dis:
+            records_long.append([
+                sid_vec[i],
+                organ,
+                model_tag,
+                d,
+                int(dis_count[i]),
+                int(is_single[i]),
+                float(age_vec[i]),
+                float(y_pred[i]),
+                float(bag[i]),
+            ])
+
+# ============================================================
+# SAVE (ALL + SINGLE)
+# ============================================================
+
+out_all = pd.DataFrame(records_long, columns=[
+    "sample_id", "organ", "model", "Disease",
+    "disease_count", "is_single_disease",
+    "age_chron", "age_pred_raw", "BAG_raw"
+])
+
+# Merge disease indicator columns for downstream filters/QA
+if disease_cols and len(out_all):
+    out_all = out_all.merge(
+        df[["sample_id", "disease_count", "is_single_disease"] + disease_cols]
+          .drop_duplicates("sample_id"),
+        on=["sample_id", "disease_count", "is_single_disease"],
+        how="left"
+    )
+
+print("\n" + "-" * 70)
+print(f"Saving ALL-disease (long) predictions: {len(out_all):,}")
+print(f"  -> {OUT_PATH_ALL}")
+out_all.to_csv(OUT_PATH_ALL, index=False)
+
+out_single = out_all[out_all["is_single_disease"] == 1].copy()
+print(f"\nSaving SINGLE-disease-only predictions: {len(out_single):,}")
+print(f"  -> {OUT_PATH_SINGLE}")
+out_single.to_csv(OUT_PATH_SINGLE, index=False)
+
+print("-" * 70)
+print("Done.\n")
