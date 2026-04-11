@@ -1,0 +1,355 @@
+#!/usr/bin/env python
+# 05_preprocessing_ALLplasma.py
+#
+# all-subjects, EDTA plasma PREPROCESSING (matches CN training as closely as possible)
+#
+# - Uses ClinicalV1_anonymized.csv for all metadata
+# - Uses Somalogic01–12V1_anonymized.csv as proteomics input
+# - Uses SomalogicMetaV1_anonymized.csv to get sample_matrix (plasma / serum / CSF)
+# - Keeps ONLY proteins used by organ models (from organ_system_mapping.json)
+# - Merges plates HORIZONTALLY by sample_id
+# - Filters to PLASMA ONLY, DROPS CITRATE plasma (keeps EDTA plasma)
+# - Basic QC:
+#     * enforce >0 for protein values
+#     * log2-transform
+#     * Global Median Normalization (per-sample)
+#     * 5-SD outlier trimming to NaN
+#     * drop zero-variance proteins
+# - Preserves ALL disease labels (-1, 0, 1, 2) and clinical fields
+# - Outputs: gnpc_processed_noncontrol.pkl
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import json
+
+# ============================================================
+# PATHS
+# ============================================================
+
+CLIN_DIR = Path("../GNPC Harmonised Dataset v1/Clinical")
+
+CLIN_PATH = CLIN_DIR / "ClinicalV1_anonymized.csv"
+PROT_DIR  = CLIN_DIR
+META_PATH = CLIN_DIR / "SomalogicMetaV1_anonymized.csv"
+
+OUT_DIR = CLIN_DIR / "processed_data_v4_python"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# organ_system_mapping.json from your CN training pipeline
+ORG_MAP_PATH = OUT_DIR / "organ_system_mapping.json"
+
+print(f"\nUsing GNPC Clinical directory:\n{CLIN_DIR}\n")
+
+# ============================================================
+# LOAD CLINICAL METADATA
+# ============================================================
+
+clin = pd.read_csv(CLIN_PATH)
+clin.columns = clin.columns.str.lower().str.strip()
+
+# Normalize age column
+if "age_at_visit" in clin.columns:
+    clin.rename(columns={"age_at_visit": "age"}, inplace=True)
+elif "age" not in clin.columns:
+    raise KeyError("Could not find 'age_at_visit' or 'age' in ClinicalV1.")
+
+if "sample_id" not in clin.columns:
+    raise KeyError("Clinical file missing 'sample_id' column.")
+
+before_clin = clin.shape[0]
+
+# --- Sex distribution BEFORE any filtering ---
+if "sex" in clin.columns:
+    print("Sex distribution BEFORE age/sex filtering (raw clinical):")
+    print(clin["sex"].value_counts().rename({1: "Male", 2: "Female"}))
+    print("")
+
+# Basic validity filters (same logic as CN side)
+clin = clin[clin["age"] >= 0]
+if "sex" in clin.columns:
+    clin = clin[clin["sex"].isin([1, 2])]
+
+after_clin = clin.shape[0]
+print(f"Clinical rows (valid age/sex): {before_clin} → {after_clin}")
+
+# --- Sex distribution AFTER clinical filtering ---
+if "sex" in clin.columns:
+    print("Sex distribution AFTER age/sex filtering (clinical only):")
+    print(clin["sex"].value_counts().rename({1: "Male", 2: "Female"}))
+    print("")
+
+valid_sample_ids = set(clin["sample_id"])
+print(f"Unique valid sample_ids in clinical: {len(valid_sample_ids)}\n")
+
+# ============================================================
+# LOAD ORGAN MAPPING & UNION OF NEEDED PROTEINS
+# ============================================================
+
+with open(ORG_MAP_PATH, "r") as f:
+    organ_map = json.load(f)
+
+# organ_map[organ] = list of seq_xxxxx features used by your models
+needed_proteins = sorted({p for plist in organ_map.values() for p in plist})
+print(f"Number of unique proteins used by organ models: {len(needed_proteins)}\n")
+
+if not needed_proteins:
+    raise RuntimeError("No proteins found in organ_system_mapping.json. Check that file.")
+
+# ============================================================
+# LOAD SOMASCAN FILES (Somalogic01–12) – HORIZONTAL MERGE
+# ============================================================
+
+prot_files = sorted(
+    f for f in PROT_DIR.glob("Somalogic*V1_anonymized.csv")
+    if "meta" not in f.name.lower()
+    and "analyte" not in f.name.lower()
+)
+
+print("Found SomaScan proteomic files:")
+for f in prot_files:
+    print("  -", f.name)
+print("")
+
+if not prot_files:
+    raise RuntimeError("No SomaScan proteomic files found (Somalogic*V1_anonymized.csv).")
+
+proteins = None
+seen_proteins = set()
+
+for fpath in prot_files:
+    print(f"Loading {fpath.name} ...")
+    df = pd.read_csv(fpath, low_memory=False)
+    df.columns = df.columns.str.lower().str.strip()
+
+    if "sample_id" not in df.columns:
+        raise KeyError(f"'sample_id' not found in {fpath.name}")
+
+    # Restrict to clinical sample_ids only
+    df = df[df["sample_id"].isin(valid_sample_ids)]
+
+    # Intersect with needed proteins, and avoid duplicates
+    seq_cols = [c for c in df.columns if c in needed_proteins and c not in seen_proteins]
+
+    if not seq_cols:
+        print("  → no new needed proteins on this plate, skipping.\n")
+        continue
+
+    seen_proteins.update(seq_cols)
+
+    use_cols = ["sample_id"] + seq_cols
+    df = df[use_cols]
+
+    # Downcast to float32 for memory; coerce bad values to NaN
+    for c in seq_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+
+    if proteins is None:
+        proteins = df
+    else:
+        # Horizontal merge on sample_id, adding new protein columns
+        proteins = proteins.merge(df, on="sample_id", how="left")
+
+    print(f"  → kept {df.shape[0]} rows, {len(seq_cols)} new proteins\n")
+
+if proteins is None:
+    raise RuntimeError("No overlapping needed proteins found in SomaScan files.")
+
+print(f"Merged proteomics (needed proteins only): {proteins.shape}\n")
+print(f"Total unique protein columns found: {len([c for c in proteins.columns if c.startswith('seq_')])}\n")
+
+# ============================================================
+# MERGE PROTEOMICS + CLINICAL (MATCH TRAINING STRUCTURE)
+# ============================================================
+
+CLIN_KEEP_BASE = [
+    "sample_id",
+    "age",
+    "sex",
+    "sample_type",
+    "sample_matrix",
+    "row_check",
+    "plate_id",
+    "contributor_code",
+    "computed_clinical_diagnosis",
+    "years_of_education",
+    "sequential_visit_number",
+]
+
+clin_keep_cols = ["sample_id"]
+clin_keep_cols += [c for c in CLIN_KEEP_BASE if c in clin.columns and c != "sample_id"]
+
+other_clin_cols = [c for c in clin.columns if c not in clin_keep_cols]
+merge_cols = clin_keep_cols + other_clin_cols
+
+data = proteins.merge(clin[merge_cols], on="sample_id", how="left")
+
+print(f"After merging proteomics + clinical: {data.shape}\n")
+
+# Re-check age/sex validity post-merge
+data = data[data["age"] >= 0]
+if "sex" in data.columns:
+    data = data[data["sex"].isin([1, 2])]
+
+print(f"After re-checking age/sex: {data.shape}\n")
+
+if "sex" in data.columns:
+    print("Final sex distribution in preprocessed dataset (after all filters):")
+    print(data["sex"].value_counts().rename({1: "Male", 2: "Female"}))
+    print("")
+
+# ============================================================
+# MERGE SOMALOGIC META TO GET MATRIX, THEN FILTER TO PLASMA (DROP CITRATE)
+# ============================================================
+
+print(f"Loading SomaLogic metadata from:\n  {META_PATH}")
+meta = pd.read_csv(META_PATH, low_memory=False)
+meta.columns = meta.columns.str.lower().str.strip()
+
+sample_id_candidates = [c for c in meta.columns if "sample_id" in c]
+if not sample_id_candidates:
+    sample_id_candidates = [c for c in meta.columns if "sample" in c and "id" in c]
+if not sample_id_candidates:
+    raise KeyError("Could not find a sample_id-like column in SomalogicMetaV1_anonymized.csv")
+
+meta_sample_col = sample_id_candidates[0]
+print(f"Using '{meta_sample_col}' as sample_id column in meta.")
+
+matrix_candidates = [c for c in meta.columns if "matrix" in c or "sample_type" in c or "matrix_type" in c]
+if not matrix_candidates:
+    raise KeyError("Could not find matrix/sample-type column in SomalogicMetaV1_anonymized.csv")
+
+meta_matrix_col = matrix_candidates[0]
+print(f"Using '{meta_matrix_col}' as matrix column in meta.\n")
+
+meta_sub = meta[[meta_sample_col, meta_matrix_col]].drop_duplicates()
+meta_sub = meta_sub.rename(columns={meta_sample_col: "sample_id", meta_matrix_col: "sample_matrix"})
+
+data = data.merge(meta_sub, on="sample_id", how="left")
+print("After merging sample_matrix from SomaLogic meta:", data.shape)
+print("sample_matrix value counts BEFORE filtering:")
+print(data["sample_matrix"].value_counts(dropna=False))
+print("")
+
+# Filter to PLASMA ONLY, but DROP CITRATE PLASMA
+matrix_col = "sample_matrix"
+before_matrix = data.shape[0]
+
+matrix_str = data[matrix_col].astype(str).str.lower()
+plasma_mask = matrix_str.str.contains("plasma", na=False)
+not_citrate_mask = ~matrix_str.str.contains("citrate", na=False)
+
+data = data[plasma_mask & not_citrate_mask].copy()
+
+after_matrix = data.shape[0]
+print(f"Matrix filtering (PLASMA, drop CITRATE): {before_matrix} → {after_matrix}")
+print("sample_matrix value counts AFTER filtering:")
+print(data[matrix_col].value_counts(dropna=False))
+print("")
+
+# ============================================================
+# QC STEP 1 – FIX ZERO/NEGATIVE PROTEIN VALUES
+# ============================================================
+
+protein_cols = [c for c in data.columns if c.startswith("seq_")]
+if not protein_cols:
+    raise RuntimeError("No protein columns (seq_*) found after merging. Check mapping vs SomaScan files.")
+
+for col in protein_cols:
+    vals = data[col].astype("float32")
+    pos = vals[vals > 0]
+
+    if len(pos) == 0:
+        data[col] = np.float32(1e-3)
+    else:
+        min_pos = np.float32(pos.min())
+        data.loc[vals <= 0, col] = min_pos
+
+# ============================================================
+# QC STEP 2 – LOG2 TRANSFORM
+# ============================================================
+
+data[protein_cols] = np.log2(data[protein_cols].astype("float32"))
+
+# ============================================================
+# GLOBAL MEDIAN NORMALIZATION (PER-SAMPLE)
+# ============================================================
+
+print("Applying Global Median Normalization...")
+
+sample_medians = data[protein_cols].median(axis=1)
+
+TARGET_MEDIAN = 11.3
+print(f"  -> Aligning samples to Target Median: {TARGET_MEDIAN}")
+
+data[protein_cols] = data[protein_cols].sub(sample_medians, axis=0) + TARGET_MEDIAN
+
+# ============================================================
+# QC STEP 3 – REMOVE 5-SD OUTLIERS (SET TO NaN)
+# ============================================================
+
+for col in protein_cols:
+    vals = data[col].astype("float32")
+    mean = vals.mean()
+    sd   = vals.std()
+    if np.isnan(sd) or sd == 0:
+        continue
+    mask = (vals - mean).abs() > (5 * sd)
+    data.loc[mask, col] = np.nan
+
+# ============================================================
+# QC STEP 4 – REMOVE ZERO-VARIANCE PROTEINS
+# ============================================================
+
+keep_prots = [c for c in protein_cols if data[c].var(skipna=True) > 1e-10]
+
+final_cols = ["sample_id"] + keep_prots + ["age"]
+if "sex" in data.columns:
+    final_cols.append("sex")
+
+for c in data.columns:
+    if c not in final_cols and c != "sample_id":
+        final_cols.append(c)
+
+data = data[final_cols]
+
+print(f"Final protein count after QC: {len(keep_prots)}")
+print(f"Final dataset shape: {data.shape}\n")
+
+# ============================================================
+# OPTIONAL: DISEASE COUNTS BY SEX (sanity check)
+# ============================================================
+
+disease_cols = [
+    "stroke","tia","tbi","ad","ftd","pd","als","mci_sci",
+    "cancer","diabetes","chf","copd","mi","afib","angina",
+    "hyperlipidaemia","hypertension","depression","anxiety"
+]
+disease_cols = [c for c in disease_cols if c in data.columns]
+
+if disease_cols and "sex" in data.columns:
+    disease_tmp = data[disease_cols].replace({-1: 0, 2: 0}).clip(0, 1)
+    disease_sex_counts = disease_tmp.groupby(data["sex"])[disease_cols].sum().T
+    disease_sex_counts.columns = ["Male", "Female"]
+    disease_sex_counts = disease_sex_counts[["Male", "Female"]]
+
+    print("===== Disease *case* counts by sex in preprocessed dataset =====")
+    print(disease_sex_counts.astype(int))
+    print("=================================================================\n")
+
+# ============================================================
+# IMPORTANT: DO NOT TOUCH DISEASE LABELS
+# ============================================================
+
+print("✔ Preserving ALL disease label values (-1, 0, 1, 2).")
+print("✔ Per-disease filtering will be done in 06_disease.\n")
+
+# ============================================================
+# SAVE OUTPUT
+# ============================================================
+
+out_path = OUT_DIR / "gnpc_processed_noncontrol.pkl"
+data.to_pickle(out_path)
+
+print(f"✔ Saved preprocessed dataset to:\n{out_path}")
+print(f"✔ Final shape: {data.shape}\n")
