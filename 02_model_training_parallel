@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+from typing import Dict, Any
+
+import pandas as pd
+from joblib import Parallel, delayed
+
+
+# ============================================================
+# Load helpers from 02_model_training (extensionless script)
+# ============================================================
+
+BASE_SCRIPT = Path(__file__).with_name("02_model_training")
+loader = importlib.machinery.SourceFileLoader("model_training_base", str(BASE_SCRIPT))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+base = importlib.util.module_from_spec(spec)
+loader.exec_module(base)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+INPUT_DIR = Path("/home/jovyan/work/GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python")
+SEED = 42
+TEST_SIZE = 0.20
+RETURN_IDS = True
+MISS_THRESH = 0.30
+OUTPUT_DIR = Path(f"results_imputation_miss{int(MISS_THRESH * 100)}")
+
+# Train the 3 model families for one organ concurrently.
+# Keep each inner GridSearchCV single-threaded to avoid 3 models x 2 jobs oversubscribing CPUs.
+MODEL_PARALLEL_N_JOBS = 3
+GRIDSEARCH_N_JOBS_PER_MODEL = 1
+MODELS_TO_TRAIN = ("lasso", "en", "svr")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def train_one_model(data: Dict[str, Any], organ: str, model_name: str) -> tuple[str, Dict[str, Any] | None, str | None]:
+    """Train one model family and return a compact result tuple."""
+    try:
+        res = base.run_model_train_eval_save(
+            data,
+            model=model_name,
+            organ=organ,
+            output_dir=OUTPUT_DIR,
+            seed=SEED,
+            gs_n_jobs=GRIDSEARCH_N_JOBS_PER_MODEL,
+        )
+        return model_name, res["metrics"], None
+    except Exception as e:
+        return model_name, None, f"{type(e).__name__}: {e}"
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    mapping_path = INPUT_DIR / "organ_system_mapping.json"
+    with open(mapping_path, "r") as f:
+        organ_map = json.load(f)
+
+    organs = list(organ_map.keys())
+    print(f"Found {len(organs)} organ systems in mapping:")
+    print(organs)
+
+    print("\nLoading gnpc_processed.pkl once...")
+    df = pd.read_pickle(INPUT_DIR / "gnpc_processed.pkl")
+    print(f"Loaded df shape: {df.shape}")
+
+    all_results: Dict[str, Any] = {}
+
+    for organ in organs:
+        print(f"\n=== Organ: {organ} ===")
+
+        data = base.preprocess_gnpc_for_organ_age_prediction(
+            df=df,
+            organ=organ,
+            organ_map=organ_map,
+            test_size=TEST_SIZE,
+            seed=SEED,
+            return_ids=RETURN_IDS,
+            miss_thresh=MISS_THRESH,
+        )
+        base.save_preprocessing_artifact(data, OUTPUT_DIR, organ)
+
+        print(
+            f"  Train kept: {data['n_train_after']}/{data['n_train_before']} "
+            f"(dropped {data['n_train_dropped_high_missing']}) | "
+            f"Test kept: {data['n_test_after']}/{data['n_test_before']} "
+            f"(dropped {data['n_test_dropped_high_missing']})"
+        )
+        print(f"  Saved preprocessing artifact: {OUTPUT_DIR / organ / 'preprocessing_artifacts.json'}")
+        print(
+            f"  Training {', '.join(MODELS_TO_TRAIN)} in parallel "
+            f"(MODEL_PARALLEL_N_JOBS={MODEL_PARALLEL_N_JOBS}, "
+            f"GRIDSEARCH_N_JOBS_PER_MODEL={GRIDSEARCH_N_JOBS_PER_MODEL})"
+        )
+
+        results = Parallel(n_jobs=MODEL_PARALLEL_N_JOBS, prefer="processes")(
+            delayed(train_one_model)(data, organ, model_name)
+            for model_name in MODELS_TO_TRAIN
+        )
+
+        all_results[organ] = {}
+        for model_name, metrics, error in results:
+            if error is not None:
+                print(f"!! Failed on organ={organ}, model={model_name}: {error}")
+                all_results[organ][model_name] = {"error": error}
+            else:
+                all_results[organ][model_name] = metrics
+                print(
+                    f"Done {organ} {model_name.upper()} | "
+                    f"test_mae={metrics['test_mae']:.3f}, "
+                    f"nested_cv_mae_mean={metrics['nested_cv_mae_mean']:.3f}"
+                )
+
+    print("\nFinished all organs.")
+
+
+if __name__ == "__main__":
+    main()
