@@ -3,18 +3,9 @@
 #
 # DISEASE BAG PREDICTION - RAW + CN TRAINING-STYLE AGE BIAS CORRECTION
 #
-# This implements the paper's "training correction" style:
-#   1) Fit BAG age-bias parameters once in the CN/control reference cohort
-#      for each selected organ model.
-#   2) Apply those CN-derived parameters to every disease-positive cohort.
-#   3) Save long and wide outputs for all disease-positive subjects.
-#
-# Bias correction (BAG-based):
-#   BAG_raw = y_pred - age
-#   Fit in CN: BAG_raw = alpha_training * age + beta_training
-#   Apply in disease: BAG_corrected = BAG_raw - (alpha_training * age + beta_training)
-
-import sys
+# Uses <MODEL_ROOT>/<Organ>/preprocessing_artifacts.json from 02_model_training
+# so CN correction and disease application use the same high-missingness rule and
+# train-median imputation as model training.
 
 import json
 from pathlib import Path
@@ -24,14 +15,9 @@ import pandas as pd
 import joblib
 from sklearn.pipeline import Pipeline
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 DEBUG = True
 
 MODEL_ROOT = Path("/home/jovyan/work/raffer pipelineScripts/results_imputation_miss30")
-
 CN_DATA_PATH = Path("../GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python/gnpc_processed.pkl")
 DISEASE_DATA_PATH = Path("../GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python/gnpc_processed_noncontrol.pkl")
 ORG_MAP_PATH = Path("../GNPC Harmonised Dataset v1/Clinical/processed_data_v4_python/organ_system_mapping.json")
@@ -45,17 +31,11 @@ PARAMS_USED_OUT_PATH = OUT_DIR / "disease_bias_params_used_trainingCorrection_al
 TRAINING_PARAMS_OUT_PATH = OUT_DIR / "training_bias_params_by_organ_imp.csv"
 
 MODEL_SELECT_METRIC = "test_mae"
-DROPNA_FEATURE_ROWS = True
-
 FALLBACK_IF_BAD_TRAINING_FIT = "raw"  # "raw" or "nan"
 MIN_N_TO_FIT_BIAS = 30
 MIN_APPLY_N = 30
-
 EXPECTED_MODELS = ("lasso", "en", "svr")
 
-# ============================================================
-# HELPERS
-# ============================================================
 
 def looks_like_estimator(obj) -> bool:
     return hasattr(obj, "predict") and callable(getattr(obj, "predict"))
@@ -73,16 +53,6 @@ def get_model_label(model_obj):
         return name
     return type(model_obj).__name__.lower()
 
-def fail_loud_all_nan_columns(X_df: pd.DataFrame, organ: str):
-    col_medians = X_df.median(axis=0, skipna=True)
-    all_nan_cols = col_medians[col_medians.isna()].index.tolist()
-    if all_nan_cols:
-        raise ValueError(
-            f"[{organ}] Found {len(all_nan_cols)} ALL-NaN protein columns "
-            f"(example: {all_nan_cols[:10]}). Fix upstream missingness or drop/retrain."
-        )
-    return col_medians
-
 def safe_read_json(path: Path):
     if not path.exists():
         return None
@@ -97,7 +67,6 @@ def discover_candidate_models_for_organ(organ: str):
     organ_dir = MODEL_ROOT / organ
     if not organ_dir.exists():
         return out
-
     for model_tag in EXPECTED_MODELS:
         md = organ_dir / model_tag
         if not md.exists():
@@ -117,32 +86,25 @@ def pick_best_model_candidate(cands, metric_key: str):
     for c in cands:
         if c["best_model_path"] is None:
             continue
-
         metrics = c.get("metrics") or {}
         val = metrics.get(metric_key, None)
-
         if val is None:
             if metric_key == "test_mae":
                 val = metrics.get("nested_cv_mae_mean", None)
             elif metric_key == "nested_cv_mae_mean":
                 val = metrics.get("test_mae", None)
-
         if val is None:
             continue
-
         try:
             scored.append((float(val), c))
         except Exception:
             continue
-
     if scored:
         scored.sort(key=lambda x: x[0])
         return scored[0][1]
-
     for c in cands:
         if c["best_model_path"] is not None:
             return c
-
     return None
 
 def subset_for_organ(base_df: pd.DataFrame, organ: str) -> pd.DataFrame:
@@ -153,7 +115,22 @@ def subset_for_organ(base_df: pd.DataFrame, organ: str) -> pd.DataFrame:
             return base_df[base_df["sex"] == 1].copy()
     return base_df.copy()
 
-def prepare_X_and_rows(input_df: pd.DataFrame, feat_list: list[str], organ: str):
+def load_preprocessing_artifact(organ: str) -> dict:
+    path = MODEL_ROOT / organ / "preprocessing_artifacts.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing preprocessing artifact for {organ}: {path}\n"
+            "Re-run 02_model_training after the artifact-saving update."
+        )
+    with open(path, "r") as f:
+        return json.load(f)
+
+def prepare_X_and_rows(input_df: pd.DataFrame, organ: str):
+    artifact = load_preprocessing_artifact(organ)
+    feat_list = artifact["feature_cols"]
+    miss_thresh = float(artifact["miss_thresh"])
+    medians = pd.Series(artifact["train_medians"], dtype="float32")
+
     missing_feats = [f for f in feat_list if f not in input_df.columns]
     if missing_feats:
         if DEBUG:
@@ -162,42 +139,28 @@ def prepare_X_and_rows(input_df: pd.DataFrame, feat_list: list[str], organ: str)
 
     work_df = input_df.copy()
     X_df = work_df[feat_list].astype("float32")
+    missing_rate = X_df.isna().mean(axis=1)
+    keep_mask = missing_rate <= miss_thresh
+    before_rows = len(work_df)
+    work_df = work_df.loc[keep_mask].copy()
+    X_df = X_df.loc[keep_mask].copy().fillna(medians).astype("float32")
 
-    col_medians = fail_loud_all_nan_columns(X_df, organ)
-
-    if DROPNA_FEATURE_ROWS:
-        before_rows = len(work_df)
-        mask_complete = ~X_df.isna().any(axis=1)
-        work_df = work_df.loc[mask_complete].copy()
-        X_df = X_df.loc[mask_complete].copy()
-        if DEBUG:
-            print(f"  [{organ}] dropna rows: {before_rows} -> {len(work_df)}")
-    else:
-        X_df = X_df.fillna(col_medians)
-
+    if DEBUG:
+        print(f"  [{organ}] training preprocessing: {before_rows} -> {len(work_df)} rows")
     if work_df.empty:
         return None, None
-
     return work_df, X_df
 
 def fit_bias_params(age_vec: np.ndarray, y_pred_vec: np.ndarray):
-    """
-    Fit BAG_raw ~ age.
-    Returns alpha, beta such that BAG_raw ~= alpha * age + beta.
-    """
     age_vec = np.asarray(age_vec, dtype=float)
     y_pred_vec = np.asarray(y_pred_vec, dtype=float)
-
     mask = np.isfinite(age_vec) & np.isfinite(y_pred_vec)
     age_fit = age_vec[mask]
     pred_fit = y_pred_vec[mask]
-
     if len(age_fit) < MIN_N_TO_FIT_BIAS:
         return np.nan, np.nan, len(age_fit), "too_few_samples"
-
     if np.nanstd(age_fit) == 0:
         return np.nan, np.nan, len(age_fit), "no_age_variation"
-
     try:
         bag_fit = pred_fit - age_fit
         alpha, beta = np.polyfit(age_fit, bag_fit, 1)
@@ -209,15 +172,11 @@ def apply_bias_correction(age_vec: np.ndarray, y_pred_vec: np.ndarray, alpha: fl
     age_vec = np.asarray(age_vec, dtype=float)
     y_pred_vec = np.asarray(y_pred_vec, dtype=float)
     bag_raw = y_pred_vec - age_vec
-    bag_corr = bag_raw - (alpha * age_vec + beta)
-    return bag_corr
+    return bag_raw - (alpha * age_vec + beta)
 
 def positive_diseases_row(row: pd.Series, disease_cols: list[str]) -> list[str]:
     return [d for d in disease_cols if int(row.get(d, 0)) == 1]
 
-# ============================================================
-# LOAD DATA + MAP
-# ============================================================
 
 print("-" * 70)
 print("LOADING CN DATA + DISEASE DATA + ORGAN MAP + MODELS")
@@ -251,13 +210,8 @@ for frame_name, frame in [("CN", cn_df), ("disease", df)]:
 
 cn_df = cn_df[cn_df["age"].notna()].copy()
 cn_df["sample_id"] = cn_df["sample_id"].astype(str)
-
 df = df[df["age"].notna()].copy()
 df["sample_id"] = df["sample_id"].astype(str)
-
-# ============================================================
-# DISEASE CLEANING
-# ============================================================
 
 disease_cols = [
     "stroke", "tia", "tbi", "ad", "ftd", "pd", "als", "mci_sci",
@@ -277,22 +231,14 @@ else:
 df_all_disease = df[df["disease_count"] >= 1].copy()
 df_all_disease["is_single_disease"] = (df_all_disease["disease_count"] == 1).astype(int)
 
-print(f"CN correction cohort:       N={len(cn_df):,}")
+print(f"CN correction cohort:        N={len(cn_df):,}")
 print(f"All disease-positive cohort: N={len(df_all_disease):,}")
 
-# ============================================================
-# PICK ONE BEST MODEL PER ORGAN
-# ============================================================
-
-orgs_to_run = [o for o in organ_map.keys()]
 organ_best = {}
-
-for organ in orgs_to_run:
-    cands = discover_candidate_models_for_organ(organ)
-    best = pick_best_model_candidate(cands, MODEL_SELECT_METRIC)
+for organ in organ_map.keys():
+    best = pick_best_model_candidate(discover_candidate_models_for_organ(organ), MODEL_SELECT_METRIC)
     if best is None:
         continue
-
     organ_best[organ] = {
         "model_tag": best["model_tag"],
         "model_path": best["best_model_path"],
@@ -301,18 +247,6 @@ for organ in orgs_to_run:
     }
 
 print(f"\nSelected best model for {len(organ_best)} organs (based on {MODEL_SELECT_METRIC}).")
-if DEBUG:
-    for org in sorted(organ_best.keys()):
-        meta = organ_best[org]
-        m = meta.get("metrics") or {}
-        print(
-            f"  {org:20s} -> {meta['model_tag']:5s} | "
-            f"test_mae={m.get('test_mae', None)} | nested_cv_mae_mean={m.get('nested_cv_mae_mean', None)}"
-        )
-
-# ============================================================
-# FIT CN TRAINING-CORRECTION PARAMS ONCE PER ORGAN
-# ============================================================
 
 training_params = {}
 training_param_rows = []
@@ -320,17 +254,14 @@ model_cache = {}
 
 print("\n" + "=" * 70)
 print("FITTING CN TRAINING-CORRECTION PARAMETERS")
-print("Fit cohort: CN/control data. Formula: BAG_raw ~ chronological age")
 print("=" * 70)
 
 for organ in sorted(organ_best.keys()):
-    feat_list = organ_map[organ]
     cn_org = subset_for_organ(cn_df, organ)
-    cn_org, X_cn_df = prepare_X_and_rows(cn_org, feat_list, organ)
+    cn_org, X_cn_df = prepare_X_and_rows(cn_org, organ)
 
     model_tag = organ_best[organ]["model_tag"]
     model_path = organ_best[organ]["model_path"]
-
     row = {
         "organ": organ,
         "model": model_tag,
@@ -353,11 +284,9 @@ for organ in sorted(organ_best.keys()):
         raise ValueError(f"[{organ}] Loaded object is not a predictor: {model_path}")
     model_cache[organ] = model
 
-    X_cn_np = X_cn_df.to_numpy(dtype=np.float32)
     cn_age = cn_org["age"].astype(float).to_numpy()
-    cn_pred_raw = model.predict(X_cn_np).astype(float)
+    cn_pred_raw = model.predict(X_cn_df.to_numpy(dtype=np.float32)).astype(float)
     cn_bag_raw = cn_pred_raw - cn_age
-
     alpha, beta, fit_n, fit_status = fit_bias_params(cn_age, cn_pred_raw)
 
     row.update({
@@ -373,23 +302,12 @@ for organ in sorted(organ_best.keys()):
     training_param_rows.append(row)
 
     if np.isfinite(alpha) and np.isfinite(beta):
-        training_params[organ] = {
-            "alpha": alpha,
-            "beta": beta,
-            "fit_n": fit_n,
-            "fit_status": fit_status,
-            "model_tag": model_tag,
-        }
+        training_params[organ] = {"alpha": alpha, "beta": beta, "fit_n": fit_n, "fit_status": fit_status, "model_tag": model_tag}
         print(f"  {organ:20s} ({model_tag}) alpha={alpha:+.4f}, beta={beta:+.4f}, CN_N={fit_n}")
     else:
         print(f"  {organ:20s} ({model_tag}) bad CN fit: {fit_status}, CN_N={fit_n}")
 
-training_params_df = pd.DataFrame(training_param_rows)
-training_params_df.to_csv(TRAINING_PARAMS_OUT_PATH, index=False)
-
-# ============================================================
-# APPLY CN TRAINING-CORRECTION PARAMS TO DISEASE COHORTS
-# ============================================================
+pd.DataFrame(training_param_rows).to_csv(TRAINING_PARAMS_OUT_PATH, index=False)
 
 params_used_rows = []
 long_records = []
@@ -400,7 +318,6 @@ print("=" * 70)
 
 for disease in disease_cols:
     apply_base = df_all_disease[df_all_disease[disease] == 1].copy()
-
     if len(apply_base) < MIN_APPLY_N:
         if DEBUG:
             print(f"\n[{disease}] skipped entirely: apply_N={len(apply_base)} < {MIN_APPLY_N}")
@@ -409,50 +326,31 @@ for disease in disease_cols:
     print(f"\n[{disease}] apply_N(all positives)={len(apply_base):,}")
 
     for organ in sorted(organ_best.keys()):
-        feat_list = organ_map[organ]
         model_tag = organ_best[organ]["model_tag"]
-
         apply_df_org = subset_for_organ(apply_base, organ)
-        apply_n_org = len(apply_df_org)
 
-        if apply_n_org < MIN_APPLY_N:
-            if DEBUG:
-                print(f"  {organ:20s} skipped: apply_N_org={apply_n_org} < {MIN_APPLY_N}")
+        if len(apply_df_org) < MIN_APPLY_N:
             params_used_rows.append({
-                "Disease": disease,
-                "organ": organ,
-                "model": model_tag,
-                "alpha_training": np.nan,
-                "beta_training": np.nan,
-                "fit_status": "not_applicable",
-                "correction_status": "skipped_small_apply_subset",
+                "Disease": disease, "organ": organ, "model": model_tag,
+                "alpha_training": np.nan, "beta_training": np.nan,
+                "fit_status": "not_applicable", "correction_status": "skipped_small_apply_subset",
                 "fit_N_training": training_params.get(organ, {}).get("fit_n", np.nan),
-                "apply_N_allDiseasePos": apply_n_org,
-                "out_path_wide": str(OUT_PATH_WIDE),
-                "out_path_long": str(OUT_PATH_LONG),
+                "apply_N_allDiseasePos": len(apply_df_org),
+                "out_path_wide": str(OUT_PATH_WIDE), "out_path_long": str(OUT_PATH_LONG),
             })
             continue
 
-        apply_df_org, X_apply_df = prepare_X_and_rows(apply_df_org, feat_list, organ)
+        apply_df_org, X_apply_df = prepare_X_and_rows(apply_df_org, organ)
         if apply_df_org is None or X_apply_df is None or apply_df_org.empty:
             continue
-
-        apply_n_post = len(apply_df_org)
-        if apply_n_post < MIN_APPLY_N:
-            if DEBUG:
-                print(f"  {organ:20s} skipped after dropna: apply_N_post={apply_n_post} < {MIN_APPLY_N}")
+        if len(apply_df_org) < MIN_APPLY_N:
             params_used_rows.append({
-                "Disease": disease,
-                "organ": organ,
-                "model": model_tag,
-                "alpha_training": np.nan,
-                "beta_training": np.nan,
-                "fit_status": "not_applicable",
-                "correction_status": "skipped_small_apply_subset_after_dropna",
+                "Disease": disease, "organ": organ, "model": model_tag,
+                "alpha_training": np.nan, "beta_training": np.nan,
+                "fit_status": "not_applicable", "correction_status": "skipped_small_apply_subset_after_training_preprocess",
                 "fit_N_training": training_params.get(organ, {}).get("fit_n", np.nan),
-                "apply_N_allDiseasePos": apply_n_post,
-                "out_path_wide": str(OUT_PATH_WIDE),
-                "out_path_long": str(OUT_PATH_LONG),
+                "apply_N_allDiseasePos": len(apply_df_org),
+                "out_path_wide": str(OUT_PATH_WIDE), "out_path_long": str(OUT_PATH_LONG),
             })
             continue
 
@@ -463,10 +361,9 @@ for disease in disease_cols:
                 raise ValueError(f"[{organ}] Loaded object is not a predictor: {organ_best[organ]['model_path']}")
             model_cache[organ] = model
 
-        X_apply_np = X_apply_df.to_numpy(dtype=np.float32)
         apply_age = apply_df_org["age"].astype(float).to_numpy()
         apply_sid = apply_df_org["sample_id"].to_numpy()
-        apply_pred_raw = model.predict(X_apply_np).astype(float)
+        apply_pred_raw = model.predict(X_apply_df.to_numpy(dtype=np.float32)).astype(float)
         apply_bag_raw = apply_pred_raw - apply_age
 
         param = training_params.get(organ)
@@ -493,17 +390,11 @@ for disease in disease_cols:
                 correction_status += "__raw_fallback"
 
         params_used_rows.append({
-            "Disease": disease,
-            "organ": organ,
-            "model": model_tag,
-            "alpha_training": alpha,
-            "beta_training": beta,
-            "fit_status": fit_status,
-            "correction_status": correction_status,
-            "fit_N_training": fit_n,
-            "apply_N_allDiseasePos": len(apply_df_org),
-            "out_path_wide": str(OUT_PATH_WIDE),
-            "out_path_long": str(OUT_PATH_LONG),
+            "Disease": disease, "organ": organ, "model": model_tag,
+            "alpha_training": alpha, "beta_training": beta,
+            "fit_status": fit_status, "correction_status": correction_status,
+            "fit_N_training": fit_n, "apply_N_allDiseasePos": len(apply_df_org),
+            "out_path_wide": str(OUT_PATH_WIDE), "out_path_long": str(OUT_PATH_LONG),
         })
 
         for i in range(len(apply_sid)):
@@ -526,34 +417,17 @@ for disease in disease_cols:
                 "fit_status": fit_status,
                 "correction_status": correction_status,
             }
-
             for dc in disease_cols:
                 rec[dc] = int(row_i[dc]) if dc in row_i.index else 0
-
             long_records.append(rec)
 
-        if DEBUG:
-            print(
-                f"  {organ:20s} ({model_tag}) {correction_status} | "
-                f"CN_N={fit_n}, apply_N={len(apply_df_org)}"
-            )
-
-# ============================================================
-# SAVE LONG
-# ============================================================
-
 out_long = pd.DataFrame(long_records)
-
 if len(out_long) == 0:
     raise RuntimeError("No records were produced. Check cohort sizes, protein coverage, and organ/model availability.")
 
 print("\n" + "-" * 70)
 print(f"Saving LONG all-disease predictions:\n  {OUT_PATH_LONG}")
 out_long.to_csv(OUT_PATH_LONG, index=False)
-
-# ============================================================
-# MAKE WIDE
-# ============================================================
 
 wide_bag = (
     out_long.pivot_table(
@@ -564,26 +438,14 @@ wide_bag = (
     )
     .reset_index()
 )
-
 non_organ_cols = {"sample_id", "Disease", "age_chron"}
-wide_bag = wide_bag.rename(
-    columns={
-        c: f"{c}_BAG_corrected_training"
-        for c in wide_bag.columns
-        if c not in non_organ_cols
-    }
-)
+wide_bag = wide_bag.rename(columns={c: f"{c}_BAG_corrected_training" for c in wide_bag.columns if c not in non_organ_cols})
 
 merge_cols = ["sample_id", "disease_count", "is_single_disease"] + disease_cols
 if "sex" in df_all_disease.columns:
     merge_cols.append("sex")
 
-wide_out = wide_bag.merge(
-    df_all_disease[merge_cols].drop_duplicates("sample_id"),
-    on="sample_id",
-    how="left",
-)
-
+wide_out = wide_bag.merge(df_all_disease[merge_cols].drop_duplicates("sample_id"), on="sample_id", how="left")
 ordered_cols = (
     ["sample_id", "Disease", "age_chron"] +
     (["sex"] if "sex" in wide_out.columns else []) +
@@ -591,15 +453,10 @@ ordered_cols = (
     sorted([c for c in wide_out.columns if c.endswith("_BAG_corrected_training")]) +
     [c for c in disease_cols if c in wide_out.columns]
 )
-
 wide_out = wide_out[ordered_cols].copy()
 
 print(f"Saving WIDE all-disease predictions:\n  {OUT_PATH_WIDE}")
 wide_out.to_csv(OUT_PATH_WIDE, index=False)
-
-# ============================================================
-# SAVE PARAMS USED
-# ============================================================
 
 params_used_df = (
     pd.DataFrame(params_used_rows)
@@ -607,7 +464,6 @@ params_used_df = (
     .sort_values(["Disease", "organ", "model"])
     .reset_index(drop=True)
 )
-
 print(f"Saving training-correction params used table:\n  {PARAMS_USED_OUT_PATH}")
 params_used_df.to_csv(PARAMS_USED_OUT_PATH, index=False)
 
