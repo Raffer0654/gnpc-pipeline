@@ -68,15 +68,19 @@ def preprocess_gnpc_for_organ_age_prediction(
     # ----------------------------
     # Drop rows with >30% missing proteins (per split)
     # ----------------------------
-    def drop_high_missing(d: pd.DataFrame) -> pd.DataFrame:
-        row_missing_rate = d[organ_cols].isna().mean(axis=1)
-        return d.loc[row_missing_rate <= miss_thresh].copy()
+    def add_missing_rate(d: pd.DataFrame) -> pd.DataFrame:
+        d = d.copy()
+        d["_organ_missing_rate"] = d[organ_cols].isna().mean(axis=1)
+        return d
+
+    train_df = add_missing_rate(train_df)
+    test_df = add_missing_rate(test_df)
 
     n_train_before = len(train_df)
     n_test_before  = len(test_df)
 
-    train_df = drop_high_missing(train_df)
-    test_df  = drop_high_missing(test_df)
+    train_df = train_df.loc[train_df["_organ_missing_rate"] <= miss_thresh].copy()
+    test_df  = test_df.loc[test_df["_organ_missing_rate"] <= miss_thresh].copy()
 
     n_train_after = len(train_df)
     n_test_after  = len(test_df)
@@ -114,8 +118,7 @@ def preprocess_gnpc_for_organ_age_prediction(
         "miss_thresh": float(miss_thresh),
         "impute": "median(train) after dropping high-missing rows",
         "median_fallback": float(median_fallback),
-
-        # bookkeeping
+        "train_medians": {k: float(v) for k, v in medians.items()},
         "n_train_before": int(n_train_before),
         "n_train_after": int(n_train_after),
         "n_train_dropped_high_missing": int(n_train_before - n_train_after),
@@ -125,10 +128,47 @@ def preprocess_gnpc_for_organ_age_prediction(
     }
 
     if return_ids:
-        out["id_train"] = train_df[id_col].to_numpy()
-        out["id_test"]  = test_df[id_col].to_numpy()
+        out["id_train"] = train_df[id_col].astype(str).to_numpy()
+        out["id_test"]  = test_df[id_col].astype(str).to_numpy()
 
     return out
+
+
+def save_preprocessing_artifact(data: Dict[str, Any], output_dir: Union[str, Path], organ: str) -> None:
+    """Save the exact per-organ preprocessing needed at inference time."""
+    artifact_dir = Path(output_dir) / organ
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact = {
+        "organ": organ,
+        "feature_cols": list(data["feature_cols"]),
+        "n_features": int(data["n_features"]),
+        "miss_thresh": float(data["miss_thresh"]),
+        "impute": data["impute"],
+        "median_fallback": float(data["median_fallback"]),
+        "train_medians": data["train_medians"],
+        "seed": int(data["seed"]),
+        "test_size": float(data["test_size"]),
+        "n_train_before": int(data["n_train_before"]),
+        "n_train_after": int(data["n_train_after"]),
+        "n_train_dropped_high_missing": int(data["n_train_dropped_high_missing"]),
+        "n_test_before": int(data["n_test_before"]),
+        "n_test_after": int(data["n_test_after"]),
+        "n_test_dropped_high_missing": int(data["n_test_dropped_high_missing"]),
+    }
+
+    if "id_train" in data:
+        artifact["id_train"] = [str(x) for x in data["id_train"]]
+    if "id_test" in data:
+        artifact["id_test"] = [str(x) for x in data["id_test"]]
+
+    with open(artifact_dir / "preprocessing_artifacts.json", "w") as f:
+        json.dump(artifact, f, indent=2)
+
+    pd.Series(data["train_medians"], name="train_median").to_csv(
+        artifact_dir / "train_medians.csv",
+        header=True,
+    )
 
 
 # ============================================================
@@ -144,12 +184,9 @@ def run_model_train_eval_save(
     outer_splits: int = 5,
     inner_splits: int = 10,
     scoring_for_tuning: str = "neg_mean_absolute_error",
-    gs_n_jobs: int = 2,  # you have 2 CPUs
+    gs_n_jobs: int = 2,
 ) -> Dict[str, Any]:
 
-    # ----------------------------
-    # Unpack data
-    # ----------------------------
     if isinstance(data, dict):
         X_train, X_test, y_train, y_test = (
             data["X_train"], data["X_test"], data["y_train"], data["y_test"]
@@ -160,9 +197,6 @@ def run_model_train_eval_save(
     y_train = np.asarray(y_train).ravel()
     y_test  = np.asarray(y_test).ravel()
 
-    # ----------------------------
-    # Output paths
-    # ----------------------------
     model_key = model.lower().strip()
     if model_key == "lasso":
         model_tag = "lasso"
@@ -174,9 +208,6 @@ def run_model_train_eval_save(
     out_dir = Path(output_dir) / organ / model_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------
-    # Build pipeline + param grid
-    # ----------------------------
     steps = [("scaler", StandardScaler())]
 
     if model_tag == "lasso":
@@ -215,16 +246,13 @@ def run_model_train_eval_save(
         verbose=1,
     )
 
-    # ----------------------------
-    # Nested CV metrics (outer loop)
-    # ----------------------------
     nested = cross_validate(
         estimator=gs,
         X=X_train,
         y=y_train,
         cv=outer_cv,
         scoring={"mae": "neg_mean_absolute_error", "rmse": "neg_root_mean_squared_error"},
-        n_jobs=1,  # avoid oversubscription
+        n_jobs=1,
         return_estimator=False,
     )
 
@@ -242,9 +270,6 @@ def run_model_train_eval_save(
         "tuning_scoring": scoring_for_tuning,
     }
 
-    # ----------------------------
-    # Final fit on full TRAIN + eval on TRAIN/TEST
-    # ----------------------------
     gs.fit(X_train, y_train)
     best_model = gs.best_estimator_
     best_params = gs.best_params_
@@ -266,9 +291,6 @@ def run_model_train_eval_save(
         "test_rmse": float(test_rmse),
     }
 
-    # ----------------------------
-    # Save artifacts
-    # ----------------------------
     joblib.dump(gs, out_dir / "gridsearchcv.joblib")
     joblib.dump(best_model, out_dir / "best_model.joblib")
 
@@ -300,13 +322,11 @@ def main():
 
     SEED = 42
     TEST_SIZE = 0.20
-    RETURN_IDS = False
+    RETURN_IDS = True
     MISS_THRESH = 0.30
 
-    # ✅ save in a separate folder with "imputation" in the name
     OUTPUT_DIR = Path(f"results_imputation_miss{int(MISS_THRESH*100)}")
 
-    # Load mapping once
     mapping_path = INPUT_DIR / "organ_system_mapping.json"
     with open(mapping_path, "r") as f:
         organ_map: Dict[str, List[str]] = json.load(f)
@@ -315,7 +335,6 @@ def main():
     print(f"Found {len(organs)} organ systems in mapping:")
     print(organs)
 
-    # Load data once
     print("\nLoading gnpc_processed.pkl once...")
     df = pd.read_pickle(INPUT_DIR / "gnpc_processed.pkl")
     print(f"Loaded df shape: {df.shape}")
@@ -334,6 +353,7 @@ def main():
             return_ids=RETURN_IDS,
             miss_thresh=MISS_THRESH,
         )
+        save_preprocessing_artifact(data, OUTPUT_DIR, organ)
 
         print(
             f"  Train kept: {data['n_train_after']}/{data['n_train_before']} "
@@ -341,6 +361,7 @@ def main():
             f"Test kept: {data['n_test_after']}/{data['n_test_before']} "
             f"(dropped {data['n_test_dropped_high_missing']})"
         )
+        print(f"  Saved preprocessing artifact: {OUTPUT_DIR / organ / 'preprocessing_artifacts.json'}")
 
         try:
             res_lasso = run_model_train_eval_save(data, model="lasso", organ=organ, output_dir=OUTPUT_DIR, seed=SEED)
