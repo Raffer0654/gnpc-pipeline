@@ -11,10 +11,22 @@ from joblib import Parallel, delayed
 
 
 # ============================================================
-# Load helpers from 02_model_training (extensionless script)
+# Load helpers from 02_model_training
 # ============================================================
 
-BASE_SCRIPT = Path(__file__).with_name("02_model_training")
+BASE_SCRIPT_CANDIDATES = [
+    Path(__file__).with_name("02_model_training.py"),
+    Path(__file__).with_name("02_model_training"),
+]
+BASE_SCRIPT = next((p for p in BASE_SCRIPT_CANDIDATES if p.exists()), None)
+if BASE_SCRIPT is None:
+    tried = "\n  - ".join(str(p) for p in BASE_SCRIPT_CANDIDATES)
+    raise FileNotFoundError(
+        "Could not find the base training script. Tried:\n"
+        f"  - {tried}\n"
+        "Make sure 02_model_training.py is in the same folder as this script."
+    )
+
 loader = importlib.machinery.SourceFileLoader("model_training_base", str(BASE_SCRIPT))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 base = importlib.util.module_from_spec(spec)
