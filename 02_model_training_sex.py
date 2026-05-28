@@ -175,7 +175,7 @@ def run_model_train_eval_save(
     *,
     seed: int = 42,
     outer_splits: int = 5,
-    inner_splits: int = 10,
+    inner_splits: int = 5,
     scoring_for_tuning: str = "neg_mean_absolute_error",
     gs_n_jobs: int = 2,
 ) -> Dict[str, Any]:
